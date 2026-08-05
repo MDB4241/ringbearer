@@ -1,5 +1,9 @@
 # ringbearer
 
+> *One does not simply type.*
+
+![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776AB) ![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)
+
 Turn the **Pebble Index 01 ring** into a push-to-talk button for your own AI
 assistant, using its Telegram DM as the conversation surface.
 
@@ -12,19 +16,25 @@ Telegram like any other conversation. Start something from the ring on a walk,
 finish it on your phone later.
 
 Works with any assistant that lives in a Telegram chat: Hermes, OpenClaw, a
-bot you wrote yourself. ~280 lines of Python; FastAPI + the MCP Python SDK +
-Pyrogram.
+bot you wrote yourself. ~280 lines of Python — FastAPI, the MCP SDK, Pyrogram.
 
 ## How it works
 
-```
-ring ──double-click──▶ Pebble app (STT) ──▶ Core cloud agent
-                                               │  calls send_to_<assistant>
-                                               ▼
-                                   phone ──HTTP──▶ this bridge
-                                                      │  Pyrogram, as you
-                                                      ▼
-                                        your Telegram DM ──▶ assistant replies
+```mermaid
+sequenceDiagram
+    participant Ring as Index 01
+    participant Phone as Pebble app
+    participant Cloud as Core cloud agent
+    participant RB as ringbearer
+    participant TG as Telegram DM
+
+    Ring->>Phone: double-click-hold + speech
+    Phone->>Phone: transcribe on device
+    Phone->>Cloud: transcript + tool list
+    Cloud->>Phone: call send_to_*
+    Phone->>RB: tools/call (Streamable HTTP, bearer token)
+    RB->>TG: post transcript as you (Pyrogram)
+    TG->>TG: assistant replies in-thread
 ```
 
 The bridge exposes exactly **one MCP tool** — `send_to_<assistant>` — whose
@@ -32,15 +42,7 @@ description tells the app's agent to relay every message verbatim and never
 answer itself. Your assistant's actual capabilities are never exposed to the
 app's cloud; it just gets a pipe.
 
-Honest nuance: this is webhook functionality built on MCP. The app's own
-webhook mode runs a full agent turn and files every capture as a note, so the
-MCP sandbox is the clean path today. There's an upstream feature request for a
-direct webhook-only mode ([coredevices/mobileapp#313](https://github.com/coredevices/mobileapp/issues/313));
-if it lands, this gets even simpler.
-
 ## Quick start
-
-Python 3.11+ recommended.
 
 ```bash
 git clone https://github.com/MDB4241/ringbearer && cd ringbearer
@@ -74,13 +76,14 @@ Under Index settings → MCP servers:
   with "Invalid tool call" (reported upstream).
 - Sandbox group **model type: Default** — the "Index Agent" type ignores
   custom MCP servers.
-- Then **Secondary Mode → MCP Sandbox** → select the group (the OK button
-  stays disabled until a group is picked).
+- Then **Secondary Mode → MCP Sandbox** → select the server group (the OK
+  button stays disabled until a group is picked).
 
 ## Running it as a service (macOS)
 
-`ringbearer.plist.example` is a launchd user-agent template — fill in your
-paths and listen IP, copy to `~/Library/LaunchAgents/`, `launchctl load`.
+[`ringbearer.plist.example`](ringbearer.plist.example) is a launchd user-agent
+template — fill in your paths and listen IP, copy to `~/Library/LaunchAgents/`,
+`launchctl load`.
 
 Two macOS traps it already accounts for:
 
@@ -104,9 +107,18 @@ Two macOS traps it already accounts for:
 - **Probes are dry-run by default.** A live probe is a real message your real
   assistant will act on; `--live` is a deliberate flag for that reason.
 
+## Design notes
+
+This is, truthfully, webhook functionality built on MCP. The app's own webhook
+mode runs a full agent turn and files every capture as a note, so the MCP
+sandbox is the clean path today. There's an upstream feature request for a
+direct webhook-only mode
+([coredevices/mobileapp#313](https://github.com/coredevices/mobileapp/issues/313));
+if it lands, this gets even simpler.
+
 ## Configuration
 
-All via `.env` (see `.env.example`):
+All via `.env` (see [`.env.example`](.env.example)):
 
 | Variable | Meaning |
 |---|---|
@@ -121,4 +133,9 @@ All via `.env` (see `.env.example`):
 
 ## License
 
-MIT
+[MIT](LICENSE)
+
+---
+
+*"Index" is Latin for "one who points out; an informer." The ring was always
+going to end up doing this.*
