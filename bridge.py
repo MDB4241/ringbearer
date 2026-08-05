@@ -512,7 +512,7 @@ def probe(live: bool = False) -> None:
         )
 
 
-def first_run() -> None:
+def first_run(fresh: bool = False) -> None:
     """The whole onboarding as one loop: look at what exists on disk, collect
     what's missing, end with a running server. Safe to re-run forever."""
     if not (HERE / ".env").exists():
@@ -525,17 +525,31 @@ def first_run() -> None:
         # Re-exec so the fresh .env is loaded cleanly, then the loop continues
         # from the next missing piece (login). Flush first: exec replaces the
         # process image, and a piped stdout would silently lose the settings.
+        # --fresh tells the next image this is still the first run.
         sys.stdout.flush()
-        os.execv(sys.executable, [sys.executable, str(HERE / "bridge.py")])
+        os.execv(sys.executable, [sys.executable, str(HERE / "bridge.py"), "--fresh"])
     missing = required_missing()
     if missing:
         incomplete_env_exit(missing)
+    just_logged_in = False
     if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
         if not sys.stdin.isatty():
             sys.exit(f"No {SESSION_NAME}.session — run: python bridge.py login")
         print("One more thing: Telegram login.\n")
         login()
+        just_logged_in = True
         print()
+    if fresh or just_logged_in:
+        # First run only: make clear the foreground server is the TEST posture,
+        # and how to graduate it to a real service.
+        print("Starting the server in THIS terminal so you can watch it work —")
+        print("double-click your ring and the tool call will log below. Ctrl-C stops it.")
+        print("To run it permanently as a background service instead (macOS):")
+        print("  mkdir -p logs")
+        print("  cp ringbearer.plist.example ~/Library/LaunchAgents/com.<you>.ringbearer.plist")
+        print("  #  ...edit the /Users/YOU paths inside it, then:")
+        print("  launchctl load ~/Library/LaunchAgents/com.<you>.ringbearer.plist")
+        print("(Details: README → Running it as a service.)\n")
     run()
 
 
@@ -552,6 +566,8 @@ if __name__ == "__main__":
             probe(live="--live" in sys.argv)
         elif cmd == "":
             first_run()
+        elif cmd == "--fresh":
+            first_run(fresh=True)
         else:
             print(__doc__)
     except (EOFError, KeyboardInterrupt):

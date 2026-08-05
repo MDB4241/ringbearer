@@ -58,6 +58,11 @@ server — finishing with the exact settings to paste into the Pebble app. Run
 it again any time: it resumes from whatever state exists, which after first
 run just means "start the server."
 
+That first server runs in your terminal on purpose — test the ring against it
+and watch the tool calls log live. When you're satisfied, Ctrl-C it and
+graduate to a real service (next section); the first run prints those exact
+steps too.
+
 The pieces also exist standalone when you need one — `bridge.py setup`,
 `bridge.py login` (e.g. after a session revocation), `bridge.py run`
 (non-interactive by design, so a service manager can never hang on a prompt),
