@@ -540,8 +540,13 @@ def first_run(fresh: bool = False) -> None:
         just_logged_in = True
         print()
     if fresh or just_logged_in:
-        # First run only: make clear the foreground server is the TEST posture,
-        # and how to graduate it to a real service.
+        # First run only: the settings the user is about to need, reprinted at
+        # the moment of need — setup's earlier printout has scrolled away by
+        # now, buried under the login exchange.
+        print_phone_settings(BIND_HOST, str(BIND_PORT), BRIDGE_TOKEN)
+        print()
+        # And make clear the foreground server is the TEST posture, plus how
+        # to graduate it to a real service.
         print("Starting the server in THIS terminal so you can watch it work —")
         print("double-click your ring and the tool call will log below. Ctrl-C stops it.")
         print("To run it permanently as a background service instead (macOS):")
