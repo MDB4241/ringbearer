@@ -1,4 +1,6 @@
-.env
+# .env and any variant (.env.bak, .env.old, .env.local) — but not the template
+.env*
+!.env.example
 *.session*
 captures.jsonl
 .venv/
