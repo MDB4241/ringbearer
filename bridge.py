@@ -14,9 +14,18 @@ assistant replies exactly as it would to a typed message.
 Works with any assistant that lives in a Telegram chat: Hermes, OpenClaw,
 a bot you wrote yourself.
 
-First-time setup:  python bridge.py setup    (walks you through every secret)
-Telegram login:    python bridge.py login    (one-time; creates the session file)
-Run the server:    .venv/bin/uvicorn bridge:app --host <reachable-ip> --port 8787
+Quick start — one command, one loop:
+
+  python bridge.py      first run: collects every secret, logs into Telegram,
+                        starts the server. Every run after: just starts the
+                        server. It resumes from whatever state exists on disk.
+
+Pieces, if you ever need one alone:
+
+  python bridge.py setup    collect secrets, write .env
+  python bridge.py login    (re)create the Telegram session
+  python bridge.py run      start the server only — non-interactive by design,
+                            so launchd/systemd can never hang on a prompt
 
 Endpoints:
   <MCP_MOUNT>/mcp   MCP server (Streamable HTTP), bearer-token gated.
@@ -58,6 +67,8 @@ TG_API_ID = os.environ.get("TG_API_ID", "")
 TG_API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_NAME = os.environ.get("SESSION_NAME", "ringbearer")
 MCP_MOUNT = os.environ.get("MCP_MOUNT", "/bridge")
+BIND_HOST = os.environ.get("BIND_HOST", "")
+BIND_PORT = int(os.environ.get("BIND_PORT", "8787"))
 
 HERE = Path(__file__).parent
 CAPTURES = HERE / "captures.jsonl"
@@ -262,7 +273,6 @@ def login() -> None:
     client.start()
     me = client.get_me()
     print(f"\nLogged in as {me.first_name} (@{me.username}) — session saved as {SESSION_NAME}.session")
-    print("If TELEGRAM_ENABLED=false in .env, flip it to true, then start the server.")
     client.stop()
 
 
@@ -281,7 +291,7 @@ def setup() -> None:
             print(f"Currently missing or empty: {', '.join(missing)}")
         return
 
-    print("ringbearer setup — four things, about three minutes.\n")
+    print("ringbearer setup — five questions, about three minutes.\n")
 
     token = secrets.token_urlsafe(32)
     print("1. Bridge token — generated for you:")
@@ -300,6 +310,12 @@ def setup() -> None:
     print("   (e.g. 'Hermes' -> send_to_hermes):")
     name = input("     ASSISTANT_NAME [assistant]: ").strip() or "assistant"
 
+    print("\n5. Where should the server listen? Use the IP your phone can reach this")
+    print("   machine at — your Tailscale IP if you use one, otherwise this")
+    print("   machine's LAN IP. (Never expose this to the internet.)")
+    host = input("     BIND_HOST: ").strip()
+    port = input("     BIND_PORT [8787]: ").strip() or "8787"
+
     env_path.write_text(
         f"BRIDGE_TOKEN={token}\n"
         "TELEGRAM_ENABLED=true\n"
@@ -307,25 +323,70 @@ def setup() -> None:
         f"ASSISTANT_NAME={name}\n"
         f"TG_API_ID={api_id}\n"
         f"TG_API_HASH={api_hash}\n"
+        f"BIND_HOST={host}\n"
+        f"BIND_PORT={port}\n"
         "SESSION_NAME=ringbearer\n"
         "# RING_PREFIX=\U0001f3a4   # prefix on relayed messages\n"
         "# MCP_MOUNT=/bridge   # MCP endpoint becomes <MCP_MOUNT>/mcp\n"
     )
     env_path.chmod(0o600)
-    print(f"\nWrote {env_path} (mode 600). Next steps:")
-    print("  1. python bridge.py login")
-    print("  2. .venv/bin/uvicorn bridge:app --host <ip-the-phone-can-reach> --port 8787")
-    print("  3. Pebble app → Index settings → MCP servers:")
-    print("       URL:    http://<that-ip>:8787/bridge/mcp   (transport: Streamable)")
-    print("       Header: Authorization: Bearer <the token above>")
-    print("       Server name: NO spaces (space-named servers break tool dispatch)")
-    print("     then Secondary Mode → MCP Sandbox → select the server group.")
+    print(f"\nWrote {env_path} (mode 600).")
+    print("\nPebble app settings (Index settings → MCP servers) — copy these now or later:")
+    print(f"  URL:     http://{host}:{port}{MCP_MOUNT}/mcp   (transport: Streamable)")
+    print(f"  Header:  Authorization: Bearer {token}")
+    print("  Name:    anything WITHOUT spaces (a space breaks tool dispatch)")
+    print("  Group:   model type Default, then Secondary Mode → MCP Sandbox → pick the group.")
+
+
+def run() -> None:
+    """Start the server. Non-interactive by design (launchd-safe): missing
+    state fails fast naming the command that fixes it — never a prompt."""
+    if not BRIDGE_TOKEN:
+        sys.exit("BRIDGE_TOKEN is not set — run: python bridge.py")
+    if not BIND_HOST:
+        sys.exit("BIND_HOST is not set — run: python bridge.py (or add BIND_HOST to .env)")
+    if TELEGRAM_ENABLED:
+        if not (TG_API_ID and TG_API_HASH and ASSISTANT_CHAT):
+            sys.exit("Telegram config incomplete — run: python bridge.py")
+        if not (HERE / f"{SESSION_NAME}.session").exists():
+            sys.exit(f"No {SESSION_NAME}.session — run: python bridge.py login")
+    import uvicorn
+
+    print(f"ringbearer → http://{BIND_HOST}:{BIND_PORT}{MCP_MOUNT}/mcp")
+    uvicorn.run(app, host=BIND_HOST, port=BIND_PORT)
+
+
+def first_run() -> None:
+    """The whole onboarding as one loop: look at what exists on disk, collect
+    what's missing, end with a running server. Safe to re-run forever."""
+    if not (HERE / ".env").exists():
+        if not sys.stdin.isatty():
+            sys.exit(
+                "No .env yet, and no terminal to ask questions in — run "
+                "`python bridge.py` interactively once (or see .env.example)."
+            )
+        setup()
+        # Re-exec so the fresh .env is loaded cleanly, then the loop continues
+        # from the next missing piece (login).
+        os.execv(sys.executable, [sys.executable, str(HERE / "bridge.py")])
+    if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
+        if not sys.stdin.isatty():
+            sys.exit(f"No {SESSION_NAME}.session — run: python bridge.py login")
+        print("One more thing: Telegram login.\n")
+        login()
+        print()
+    run()
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "setup":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "setup":
         setup()
-    elif len(sys.argv) > 1 and sys.argv[1] == "login":
+    elif cmd == "login":
         login()
+    elif cmd == "run":
+        run()
+    elif cmd == "":
+        first_run()
     else:
         print(__doc__)

@@ -47,16 +47,21 @@ app's cloud; it just gets a pipe.
 ```bash
 git clone https://github.com/MDB4241/ringbearer && cd ringbearer
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-
-.venv/bin/python bridge.py setup    # interactive: walks you through every secret
-.venv/bin/python bridge.py login    # one-time Telegram login (as YOUR account)
-.venv/bin/uvicorn bridge:app --host <ip-the-phone-can-reach> --port 8787
+.venv/bin/python bridge.py
 ```
 
-`setup` generates the bearer token, points you at
-[my.telegram.org/apps](https://my.telegram.org/apps) for API credentials, asks
-which chat your assistant lives in, and writes `.env` (mode 600). `login`
-creates the Pyrogram session file. That's all the state there is.
+That last command is the whole onboarding, one loop: it generates your bearer
+token, walks you to [my.telegram.org/apps](https://my.telegram.org/apps) for
+API credentials, asks which chat your assistant lives in and where to listen,
+writes `.env` (mode 600), logs you into Telegram (one-time), and starts the
+server — finishing with the exact settings to paste into the Pebble app. Run
+it again any time: it resumes from whatever state exists, which after first
+run just means "start the server."
+
+The pieces also exist standalone when you need one — `bridge.py setup`,
+`bridge.py login` (e.g. after a session revocation), and `bridge.py run`,
+which is non-interactive by design so a service manager can never hang on a
+prompt.
 
 Verify without touching your real DM:
 
@@ -82,7 +87,8 @@ Under Index settings → MCP servers:
 ## Running it as a service (macOS)
 
 [`ringbearer.plist.example`](ringbearer.plist.example) is a launchd user-agent
-template — fill in your paths and listen IP, copy to `~/Library/LaunchAgents/`,
+template — it just runs `bridge.py run` (host and port come from `.env`), so
+the only thing to edit is your checkout path. Copy to `~/Library/LaunchAgents/`,
 `launchctl load`.
 
 Two macOS traps it already accounts for:
@@ -127,6 +133,7 @@ All via `.env` (see [`.env.example`](.env.example)):
 | `ASSISTANT_CHAT` | `@botusername` or chat id of the assistant DM |
 | `ASSISTANT_NAME` | Display name; becomes the tool name (`Hermes` → `send_to_hermes`) |
 | `TG_API_ID` / `TG_API_HASH` | Telegram API credentials (my.telegram.org) |
+| `BIND_HOST` / `BIND_PORT` | Listen address — the IP your phone can reach (default port `8787`) |
 | `SESSION_NAME` | Pyrogram session file name (default `ringbearer`) |
 | `RING_PREFIX` | Prefix on relayed messages (default 🎤) |
 | `MCP_MOUNT` | Mount path; endpoint is `<MCP_MOUNT>/mcp` (default `/bridge`) |

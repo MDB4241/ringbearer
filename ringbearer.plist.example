@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd user agent for macOS. Replace /Users/YOU/ringbearer with your
-  checkout path and LISTEN_IP with the IP the phone reaches (your Tailscale
-  IP if you use a tailnet — recommended — otherwise a LAN IP).
+  launchd user agent for macOS. The only edit needed: replace
+  /Users/YOU/ringbearer with your checkout path everywhere — host and port
+  come from .env (`bridge.py run` reads them, and fails fast with a named
+  fix instead of prompting if anything is missing).
 
   NOTE: the checkout must NOT live under ~/Documents, ~/Desktop, or
   ~/Downloads — macOS TCC blocks launchd agents from reading those. ~/Projects
@@ -19,12 +20,9 @@
     <string>com.YOU.ringbearer</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/YOU/ringbearer/.venv/bin/uvicorn</string>
-        <string>bridge:app</string>
-        <string>--host</string>
-        <string>LISTEN_IP</string>
-        <string>--port</string>
-        <string>8787</string>
+        <string>/Users/YOU/ringbearer/.venv/bin/python</string>
+        <string>/Users/YOU/ringbearer/bridge.py</string>
+        <string>run</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/Users/YOU/ringbearer</string>
