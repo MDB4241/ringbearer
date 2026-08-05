@@ -28,6 +28,8 @@ Pieces, if you ever need one alone:
                             so launchd/systemd can never hang on a prompt
   python ringbearer.py probe    client-side diagnostic: connect like the phone
                             would and call the tool (dry run; --live sends)
+  python ringbearer.py service  install the launchd agent — a real background
+                            service (macOS; `service uninstall` removes it)
 
 Endpoints:
   <MCP_MOUNT>/mcp   MCP server (Streamable HTTP), bearer-token gated.
@@ -541,6 +543,111 @@ def probe(live: bool = False) -> None:
         )
 
 
+def render_plist(label: str) -> str:
+    """The launchd plist with this checkout's real paths baked in."""
+    python = HERE / ".venv" / "bin" / "python"
+    if not python.exists():
+        python = Path(sys.executable)
+    logs = HERE / "logs"
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>{HERE / "ringbearer.py"}</string>
+        <string>run</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{HERE}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{logs / "ringbearer.log"}</string>
+    <key>StandardErrorPath</key>
+    <string>{logs / "ringbearer.error.log"}</string>
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+    </array>
+</dict>
+</plist>
+"""
+
+
+def service(uninstall: bool = False) -> None:
+    """Install (or remove) the launchd user agent — the graduation from a
+    terminal-tied server to one that survives reboots and crashes."""
+    if sys.platform != "darwin":
+        sys.exit("`service` is macOS-only (launchd). On Linux, run `ringbearer.py run` under systemd.")
+    import getpass
+    import subprocess
+
+    label = f"com.{getpass.getuser()}.ringbearer"
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+    if uninstall:
+        if not plist_path.exists():
+            print(f"Nothing installed ({plist_path} doesn't exist).")
+            return
+        subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)
+        plist_path.unlink()
+        print(green(f"Stopped and removed {label}."))
+        return
+
+    for blocked in ("Documents", "Desktop", "Downloads"):
+        if Path.home() / blocked in HERE.parents:
+            sys.exit(
+                f"This checkout lives under ~/{blocked}, which launchd agents can't read\n"
+                "(macOS TCC). Move it somewhere like ~/Projects and rerun."
+            )
+    missing = required_missing()
+    if missing:
+        incomplete_env_exit(missing)
+    if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
+        sys.exit(f"No {SESSION_NAME}.session — run: python ringbearer.py login")
+    check_bindable(BIND_HOST)
+    s = socket.socket()
+    s.settimeout(0.5)
+    in_use = s.connect_ex((BIND_HOST, BIND_PORT)) == 0
+    s.close()
+    if in_use:
+        sys.exit(
+            f"Something already listens on {BIND_HOST}:{BIND_PORT} — Ctrl-C the "
+            "foreground server first, then rerun."
+        )
+
+    (HERE / "logs").mkdir(exist_ok=True)
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(render_plist(label))
+    subprocess.run(["launchctl", "unload", str(plist_path)], capture_output=True)  # reinstall-safe
+    r = subprocess.run(["launchctl", "load", str(plist_path)], capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"launchctl load failed: {(r.stderr or r.stdout).strip()}")
+
+    import urllib.request
+
+    url = f"http://{BIND_HOST}:{BIND_PORT}/healthz"
+    for _ in range(10):
+        time.sleep(1)
+        try:
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                body = resp.read().decode().strip()
+            print(green(f"{label} is up — {url} → {body}"))
+            break
+        except OSError:
+            continue
+    else:
+        print(yellow(f"Loaded, but {url} isn't answering yet — check {HERE / 'logs' / 'ringbearer.error.log'}"))
+    print(f"Logs: {HERE / 'logs'} · stop: python ringbearer.py service uninstall")
+
+
 def first_run(fresh: bool = False) -> None:
     """The whole onboarding as one loop: look at what exists on disk, collect
     what's missing, end with a running server. Safe to re-run forever."""
@@ -578,12 +685,9 @@ def first_run(fresh: bool = False) -> None:
         # to graduate it to a real service.
         print(bold("Starting the server in THIS terminal") + " so you can watch it work —")
         print("double-click your ring and the tool call will log below. Ctrl-C stops it.")
-        print("To run it permanently as a background service instead (macOS):")
-        print("  mkdir -p logs")
-        print("  cp ringbearer.plist.example ~/Library/LaunchAgents/com.<you>.ringbearer.plist")
-        print("  #  ...edit the /Users/YOU paths inside it, then:")
-        print("  launchctl load ~/Library/LaunchAgents/com.<you>.ringbearer.plist")
-        print("(Details: README → Running it as a service.)\n")
+        print("To run it permanently as a background service instead (macOS, one command):")
+        print("  " + bold("python ringbearer.py service"))
+        print(dim("(Details: README → Running it as a service.)\n"))
     run()
 
 
@@ -598,6 +702,8 @@ if __name__ == "__main__":
             run()
         elif cmd == "probe":
             probe(live="--live" in sys.argv)
+        elif cmd == "service":
+            service(uninstall=len(sys.argv) > 2 and sys.argv[2] == "uninstall")
         elif cmd == "":
             first_run()
         elif cmd == "--fresh":

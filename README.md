@@ -100,19 +100,20 @@ Under Index settings → MCP servers:
 
 ## Running it as a service (macOS)
 
-[`ringbearer.plist.example`](ringbearer.plist.example) is a launchd user-agent
-template — it just runs `ringbearer.py run` (host and port come from `.env`), so
-the only thing to edit is your checkout path. Create the log directory first
-(`mkdir -p logs` — launchd won't create it), then copy to
-`~/Library/LaunchAgents/` and `launchctl load`.
+```bash
+.venv/bin/python ringbearer.py service            # install + start the launchd agent
+.venv/bin/python ringbearer.py service uninstall  # stop + remove it
+```
 
-Two macOS traps it already accounts for:
+`service` writes the plist with your real paths, creates `logs/`, loads the
+agent, and polls `/healthz` until it answers. It also refuses the two classic
+traps up front: a checkout under `~/Documents`/`~/Desktop`/`~/Downloads`
+(macOS TCC blocks launchd agents from reading those), and a port still held
+by a foreground server.
 
-- The checkout must **not** live under `~/Documents`, `~/Desktop`, or
-  `~/Downloads` — TCC blocks launchd agents from reading those.
-- Pyrogram anchors its session file to the *launching script's* directory
-  (`.venv/bin` under uvicorn); `ringbearer.py` pins `workdir` to its own directory
-  so the session `login` writes is the one the server finds.
+Hand-rollers and Linux users:
+[`ringbearer.plist.example`](ringbearer.plist.example) is the equivalent
+template, and `ringbearer.py run` under systemd works the same way.
 
 ## Security notes
 

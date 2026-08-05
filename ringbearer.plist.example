@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd user agent for macOS. The only edit needed: replace
+  Hand-roll template — `python ringbearer.py service` does all of this
+  for you automatically. If you prefer manual: the only edit needed: replace
   /Users/YOU/ringbearer with your checkout path everywhere — host and port
   come from .env (`ringbearer.py run` reads them, and fails fast with a named
   fix instead of prompting if anything is missing).
@@ -32,9 +33,9 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/YOU/ringbearer/logs/bridge.log</string>
+    <string>/Users/YOU/ringbearer/logs/ringbearer.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/YOU/ringbearer/logs/bridge.error.log</string>
+    <string>/Users/YOU/ringbearer/logs/ringbearer.error.log</string>
     <key>LimitLoadToSessionType</key>
     <array>
         <string>Aqua</string>
