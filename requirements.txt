@@ -1,3 +1,4 @@
+# Needs Python 3.10+ (stock macOS python3 is older)
 fastapi==0.141.1
 uvicorn==0.52.1
 python-dotenv==1.2.2

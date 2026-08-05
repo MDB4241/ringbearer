@@ -36,6 +36,11 @@ Endpoints:
   /healthz          Open liveness check.
 """
 
+import sys
+
+if sys.version_info < (3, 10):
+    sys.exit(f"ringbearer needs Python 3.10+ (you have {sys.version.split()[0]}).")
+
 # Python 3.14+: Pyrogram's sync module calls asyncio.get_event_loop() at import
 # time, which raises if no loop is set yet. Ensure one exists before importing.
 import asyncio
