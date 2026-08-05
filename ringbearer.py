@@ -278,7 +278,16 @@ async def lifespan(app: FastAPI):
                 "— run: python ringbearer.py login"
             )
         tg_client = make_tg_client()
-        await tg_client.start()
+        try:
+            await tg_client.start()
+        except Exception as e:
+            # A revoked/terminated session (AUTH_KEY_UNREGISTERED) otherwise
+            # surfaces as a bare traceback in a launchd crash loop.
+            raise RuntimeError(
+                f"Telegram client failed to start ({type(e).__name__}: {e}).\n"
+                f"If this session was revoked or terminated, delete "
+                f"{SESSION_NAME}.session and run: python ringbearer.py login"
+            ) from e
     async with mcp.session_manager.run():
         yield
     if tg_client is not None:
