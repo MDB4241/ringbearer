@@ -111,6 +111,11 @@ Two macOS traps it already accounts for:
 
 ## Security notes
 
+- **Your words pass through Pebble's cloud.** The phone transcribes on device,
+  but the transcript goes to the app's cloud agent so it can decide to call
+  this tool. The bridge is the last hop, not the only one — see the diagram
+  above. (A direct webhook mode, [#313](https://github.com/coredevices/mobileapp/issues/313),
+  would remove that hop.)
 - **Bind deliberately.** Prefer a [Tailscale](https://tailscale.com) address so
   the bridge is reachable from anywhere but never exposed to the LAN or
   internet; WireGuard makes plain HTTP acceptable inside the tailnet. Never

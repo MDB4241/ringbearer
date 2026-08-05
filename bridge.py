@@ -47,6 +47,7 @@ import hmac
 import json
 import os
 import re
+import socket
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -73,6 +74,8 @@ ASSISTANT_CHAT = int(_chat) if re.fullmatch(r"-?\d+", _chat) else _chat
 ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "assistant")
 RING_PREFIX = os.environ.get("RING_PREFIX", "\U0001f3a4 ")
 TG_API_ID = os.environ.get("TG_API_ID", "")
+if TG_API_ID and not TG_API_ID.isdigit():
+    sys.exit(f"TG_API_ID in .env is not a number — edit {HERE / '.env'}")
 TG_API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_NAME = os.environ.get("SESSION_NAME", "ringbearer")
 MCP_MOUNT = os.environ.get("MCP_MOUNT", "/bridge")
@@ -154,7 +157,9 @@ async def send_to_assistant(message: str) -> str:
     started = time.monotonic()
     err = None
     try:
-        sent = await deliver(message)
+        # Bounded: a Pyrogram stall must not hold the transcript hostage —
+        # timeout lands in the except and the capture row still gets written.
+        sent = await asyncio.wait_for(deliver(message), timeout=30)
     except Exception as e:  # the transcript is the only copy — log it no matter what
         sent, err = False, repr(e)
     send_ms = round((time.monotonic() - started) * 1000)
@@ -289,6 +294,18 @@ def login() -> None:
     """One-time interactive Pyrogram login; creates the session file."""
     if not (TG_API_ID and TG_API_HASH):
         sys.exit("Set TG_API_ID and TG_API_HASH in .env first (python bridge.py setup)")
+    # Refuse while the server is up: two Pyrogram clients on one session file
+    # can trigger AUTH_KEY_DUPLICATED and get the Telegram session revoked.
+    s = socket.socket()
+    s.settimeout(0.5)
+    server_up = s.connect_ex((BIND_HOST or "127.0.0.1", BIND_PORT)) == 0
+    s.close()
+    if server_up:
+        sys.exit(
+            "The bridge appears to be running — stop it first (Ctrl-C it, or "
+            "launchctl unload the agent).\nTwo clients on one session file can "
+            "get your Telegram session revoked."
+        )
     print("Log in with YOUR Telegram account — the bridge posts as you.")
     print("Phone number must be in full international format, e.g. +12025550143")
     print("(leading + and country code are required — a bare local number is rejected)\n")
@@ -312,6 +329,8 @@ def setup() -> None:
         ]
         if missing:
             print(f"Currently missing or empty: {', '.join(missing)}")
+        if BRIDGE_TOKEN and BIND_HOST:
+            print_phone_settings(BIND_HOST, str(BIND_PORT), BRIDGE_TOKEN)
         return
 
     def ask(prompt: str, *, default: str | None = None, numeric: bool = False) -> str:
@@ -353,9 +372,20 @@ def setup() -> None:
     print("   - LAN IP (192.168.x.x) — works, but only while your phone is on the")
     print("     same network, and anyone on that network can reach the port.")
     print("   Never expose this to the public internet.")
-    host = ask("     BIND_HOST: ")
+    while True:
+        host = ask("     BIND_HOST: ")
+        try:
+            _s = socket.socket()
+            _s.bind((host, 0))
+            _s.close()
+            break
+        except OSError:
+            print("     (this machine can't bind that address — is Tailscale up?")
+            print("      `ifconfig` shows what's available)")
     port = ask("     BIND_PORT [8787]: ", default="8787", numeric=True)
 
+    # Restricted from birth: no umask-default window with the token inside.
+    env_path.touch(mode=0o600)
     env_path.write_text(
         f"BRIDGE_TOKEN={token}\n"
         "TELEGRAM_ENABLED=true\n"
@@ -371,11 +401,7 @@ def setup() -> None:
     )
     env_path.chmod(0o600)
     print(f"\nWrote {env_path} (mode 600).")
-    print("\nPebble app settings (Index settings → MCP servers) — copy these now or later:")
-    print(f"  URL:     http://{host}:{port}{MCP_MOUNT}/mcp   (transport: Streamable)")
-    print(f"  Header:  Authorization: Bearer {token}")
-    print("  Name:    anything WITHOUT spaces (a space breaks tool dispatch)")
-    print("  Group:   model type Default, then Secondary Mode → MCP Sandbox → pick the group.")
+    print_phone_settings(host, port, token)
 
 
 def required_missing() -> list[str]:
@@ -391,6 +417,30 @@ def required_missing() -> list[str]:
             ) if not v
         ]
     return missing
+
+
+def check_bindable(host: str) -> None:
+    """This machine must actually hold the address — otherwise uvicorn dies
+    later with a bare errno at the moment the user expects a running server."""
+    try:
+        s = socket.socket()
+        s.bind((host, 0))
+        s.close()
+    except OSError as e:
+        sys.exit(
+            f"Can't bind {host} ({e.strerror or e}) — this machine doesn't hold that\n"
+            "address right now. Is Tailscale up? `ifconfig` lists what's available;\n"
+            f"fix BIND_HOST in {HERE / '.env'}."
+        )
+
+
+def print_phone_settings(host: str, port: str, token: str) -> None:
+    print("\nPebble app settings (Index settings → MCP servers) — reprint any time")
+    print("with `python bridge.py setup`:")
+    print(f"  URL:     http://{host}:{port}{MCP_MOUNT}/mcp   (transport: Streamable)")
+    print(f"  Header:  Authorization: Bearer {token}")
+    print("  Name:    anything WITHOUT spaces (a space breaks tool dispatch)")
+    print("  Group:   model type Default, then Secondary Mode → MCP Sandbox → pick the group.")
 
 
 def incomplete_env_exit(missing: list[str]) -> None:
@@ -409,9 +459,16 @@ def run() -> None:
         incomplete_env_exit(missing)
     if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
         sys.exit(f"No {SESSION_NAME}.session — run: python bridge.py login")
+    check_bindable(BIND_HOST)
     import uvicorn
 
     print(f"ringbearer → http://{BIND_HOST}:{BIND_PORT}{MCP_MOUNT}/mcp")
+    if not TELEGRAM_ENABLED:
+        print(
+            "WARNING: TELEGRAM_ENABLED=false — captures are logged to "
+            "captures.jsonl only, NOT delivered to Telegram.",
+            flush=True,
+        )
     uvicorn.run(app, host=BIND_HOST, port=BIND_PORT)
 
 
