@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd user agent for macOS. Replace /Users/YOU/ring-bridge with your
+  launchd user agent for macOS. Replace /Users/YOU/ringbearer with your
   checkout path and LISTEN_IP with the IP the phone reaches (your Tailscale
   IP if you use a tailnet — recommended — otherwise a LAN IP).
 
@@ -10,16 +10,16 @@
   or similar works.
 
   Install:
-    cp ring-bridge.plist.example ~/Library/LaunchAgents/com.YOU.ring-bridge.plist
-    launchctl load ~/Library/LaunchAgents/com.YOU.ring-bridge.plist
+    cp ringbearer.plist.example ~/Library/LaunchAgents/com.YOU.ringbearer.plist
+    launchctl load ~/Library/LaunchAgents/com.YOU.ringbearer.plist
 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.YOU.ring-bridge</string>
+    <string>com.YOU.ringbearer</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/YOU/ring-bridge/.venv/bin/uvicorn</string>
+        <string>/Users/YOU/ringbearer/.venv/bin/uvicorn</string>
         <string>bridge:app</string>
         <string>--host</string>
         <string>LISTEN_IP</string>
@@ -27,15 +27,15 @@
         <string>8787</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/YOU/ring-bridge</string>
+    <string>/Users/YOU/ringbearer</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/YOU/ring-bridge/logs/bridge.log</string>
+    <string>/Users/YOU/ringbearer/logs/bridge.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/YOU/ring-bridge/logs/bridge.error.log</string>
+    <string>/Users/YOU/ringbearer/logs/bridge.error.log</string>
     <key>LimitLoadToSessionType</key>
     <array>
         <string>Aqua</string>

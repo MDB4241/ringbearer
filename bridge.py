@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-ring-bridge: Pebble Index 01 ring -> your AI assistant's Telegram DM.
+ringbearer: Pebble Index 01 ring -> your AI assistant's Telegram DM.
+
+One does not simply type. Ringbearer carries your spoken words from the ring
+to your assistant, delivered as you.
 
 Double-click-hold the ring and speak. The Pebble app's MCP sandbox agent calls
 this bridge's send_to_<assistant> tool with the transcript, and the bridge
@@ -53,7 +56,7 @@ ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "assistant")
 RING_PREFIX = os.environ.get("RING_PREFIX", "\U0001f3a4 ")
 TG_API_ID = os.environ.get("TG_API_ID", "")
 TG_API_HASH = os.environ.get("TG_API_HASH", "")
-SESSION_NAME = os.environ.get("SESSION_NAME", "ring_bridge")
+SESSION_NAME = os.environ.get("SESSION_NAME", "ringbearer")
 MCP_MOUNT = os.environ.get("MCP_MOUNT", "/bridge")
 
 HERE = Path(__file__).parent
@@ -98,7 +101,7 @@ async def deliver(message: str) -> bool:
 
 # --- MCP server ---------------------------------------------------------------
 
-mcp = MCPServer("ring-bridge")
+mcp = MCPServer("ringbearer")
 
 
 @mcp.tool(
@@ -278,7 +281,7 @@ def setup() -> None:
             print(f"Currently missing or empty: {', '.join(missing)}")
         return
 
-    print("ring-bridge setup — four things, about three minutes.\n")
+    print("ringbearer setup — four things, about three minutes.\n")
 
     token = secrets.token_urlsafe(32)
     print("1. Bridge token — generated for you:")
@@ -304,7 +307,7 @@ def setup() -> None:
         f"ASSISTANT_NAME={name}\n"
         f"TG_API_ID={api_id}\n"
         f"TG_API_HASH={api_hash}\n"
-        "SESSION_NAME=ring_bridge\n"
+        "SESSION_NAME=ringbearer\n"
         "# RING_PREFIX=\U0001f3a4   # prefix on relayed messages\n"
         "# MCP_MOUNT=/bridge   # MCP endpoint becomes <MCP_MOUNT>/mcp\n"
     )

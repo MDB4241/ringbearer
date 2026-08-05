@@ -1,4 +1,4 @@
-# ring-bridge
+# ringbearer
 
 Turn the **Pebble Index 01 ring** into a push-to-talk button for your own AI
 assistant, using its Telegram DM as the conversation surface.
@@ -43,7 +43,7 @@ if it lands, this gets even simpler.
 Python 3.11+ recommended.
 
 ```bash
-git clone https://github.com/MDB4241/ring-bridge && cd ring-bridge
+git clone https://github.com/MDB4241/ringbearer && cd ringbearer
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python bridge.py setup    # interactive: walks you through every secret
@@ -79,7 +79,7 @@ Under Index settings → MCP servers:
 
 ## Running it as a service (macOS)
 
-`ring-bridge.plist.example` is a launchd user-agent template — fill in your
+`ringbearer.plist.example` is a launchd user-agent template — fill in your
 paths and listen IP, copy to `~/Library/LaunchAgents/`, `launchctl load`.
 
 Two macOS traps it already accounts for:
@@ -115,7 +115,7 @@ All via `.env` (see `.env.example`):
 | `ASSISTANT_CHAT` | `@botusername` or chat id of the assistant DM |
 | `ASSISTANT_NAME` | Display name; becomes the tool name (`Hermes` → `send_to_hermes`) |
 | `TG_API_ID` / `TG_API_HASH` | Telegram API credentials (my.telegram.org) |
-| `SESSION_NAME` | Pyrogram session file name (default `ring_bridge`) |
+| `SESSION_NAME` | Pyrogram session file name (default `ringbearer`) |
 | `RING_PREFIX` | Prefix on relayed messages (default 🎤) |
 | `MCP_MOUNT` | Mount path; endpoint is `<MCP_MOUNT>/mcp` (default `/bridge`) |
 
