@@ -290,7 +290,7 @@ def login() -> None:
     if not (TG_API_ID and TG_API_HASH):
         sys.exit("Set TG_API_ID and TG_API_HASH in .env first (python bridge.py setup)")
     print("Log in with YOUR Telegram account — the bridge posts as you.")
-    print("Phone number must be in full international format, e.g. +15125551234")
+    print("Phone number must be in full international format, e.g. +12025550143")
     print("(leading + and country code are required — a bare local number is rejected)\n")
     client = make_tg_client()
     client.start()
