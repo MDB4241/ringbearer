@@ -310,9 +310,13 @@ def setup() -> None:
     print("   (e.g. 'Hermes' -> send_to_hermes):")
     name = input("     ASSISTANT_NAME [assistant]: ").strip() or "assistant"
 
-    print("\n5. Where should the server listen? Use the IP your phone can reach this")
-    print("   machine at — your Tailscale IP if you use one, otherwise this")
-    print("   machine's LAN IP. (Never expose this to the internet.)")
+    print("\n5. Where should the server listen? Give the IP your phone can reach")
+    print("   this machine at:")
+    print("   - Tailscale IP (100.x.x.x) — recommended: works from anywhere, and")
+    print("     the port is never visible to your LAN or the internet.")
+    print("   - LAN IP (192.168.x.x) — works, but only while your phone is on the")
+    print("     same network, and anyone on that network can reach the port.")
+    print("   Never expose this to the public internet.")
     host = input("     BIND_HOST: ").strip()
     port = input("     BIND_PORT [8787]: ").strip() or "8787"
 
