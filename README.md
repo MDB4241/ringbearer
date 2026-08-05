@@ -43,7 +43,7 @@ if it lands, this gets even simpler.
 Python 3.11+ recommended.
 
 ```bash
-git clone https://github.com/YOU/ring-bridge && cd ring-bridge
+git clone https://github.com/MDB4241/ring-bridge && cd ring-bridge
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 .venv/bin/python bridge.py setup    # interactive: walks you through every secret
