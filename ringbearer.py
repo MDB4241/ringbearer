@@ -343,6 +343,10 @@ def login() -> None:
     me = client.get_me()
     print(green(f"\nLogged in as {me.first_name} (@{me.username}) — session saved as {SESSION_NAME}.session"))
     client.stop()
+    # The session file IS the Telegram account — Pyrogram creates it at the
+    # umask default (644); pull it to owner-only like .env and captures.jsonl.
+    for f in HERE.glob(f"{SESSION_NAME}.session*"):
+        f.chmod(0o600)
 
 
 def setup() -> None:
