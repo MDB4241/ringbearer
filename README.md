@@ -134,8 +134,3 @@ All via `.env` (see [`.env.example`](.env.example)):
 ## License
 
 [MIT](LICENSE)
-
----
-
-*"Index" is Latin for "one who points out; an informer." The ring was always
-going to end up doing this.*
