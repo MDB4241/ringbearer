@@ -68,7 +68,7 @@ The pieces also exist standalone when you need one — `ringbearer.py setup`,
 (non-interactive by design, so a service manager can never hang on a prompt),
 and `ringbearer.py probe`.
 
-A note on Python versions: tested on 3.13. The Telegram layer, `pyrogram`
+A note on Python versions: tested on 3.11 and 3.13. The Telegram layer, `pyrogram`
 2.0.106, is its author's final release and only declares support through
 3.11 — `ringbearer.py` carries a small event-loop guard that keeps it working on
 newer interpreters, but future breakage there is possible.
@@ -140,7 +140,7 @@ template, and `ringbearer.py run` under systemd works the same way.
 
 ## Design notes
 
-This is, truthfully, webhook functionality built on MCP. The app's own webhook
+This is webhook functionality built on MCP. The app's own webhook
 mode runs a full agent turn and files every capture as a note, so the MCP
 sandbox is the clean path today. There's an upstream feature request for a
 direct webhook-only mode
@@ -161,7 +161,7 @@ All via `.env` (see [`.env.example`](.env.example)):
 | `BIND_HOST` / `BIND_PORT` | Listen address — the IP your phone can reach (default port `8787`) |
 | `SESSION_NAME` | Pyrogram session file name (default `ringbearer`) |
 | `RING_PREFIX` | Prefix on relayed messages (default 🎤) |
-| `MCP_MOUNT` | Mount path; endpoint is `<MCP_MOUNT>/mcp` (default `/bridge`) |
+| `MCP_MOUNT` | Mount path; endpoint is `<MCP_MOUNT>/mcp` (default `/ringbearer`) |
 
 ## License
 
