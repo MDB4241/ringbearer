@@ -47,7 +47,7 @@ app's cloud; it just gets a pipe.
 ```bash
 git clone https://github.com/MDB4241/ringbearer && cd ringbearer
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/python bridge.py
+.venv/bin/python ringbearer.py
 ```
 
 That last command is the whole onboarding, one loop: it generates your bearer
@@ -63,21 +63,21 @@ and watch the tool calls log live. When you're satisfied, Ctrl-C it and
 graduate to a real service (next section); the first run prints those exact
 steps too.
 
-The pieces also exist standalone when you need one — `bridge.py setup`,
-`bridge.py login` (e.g. after a session revocation), `bridge.py run`
+The pieces also exist standalone when you need one — `ringbearer.py setup`,
+`ringbearer.py login` (e.g. after a session revocation), `ringbearer.py run`
 (non-interactive by design, so a service manager can never hang on a prompt),
-and `bridge.py probe`.
+and `ringbearer.py probe`.
 
 A note on Python versions: tested on 3.13. The Telegram layer, `pyrogram`
 2.0.106, is its author's final release and only declares support through
-3.11 — `bridge.py` carries a small event-loop guard that keeps it working on
+3.11 — `ringbearer.py` carries a small event-loop guard that keeps it working on
 newer interpreters, but future breakage there is possible.
 
 Verify without touching your real DM:
 
 ```bash
-.venv/bin/python bridge.py probe           # dry run — exercises auth + MCP + logging
-.venv/bin/python bridge.py probe --live    # actually sends one real message
+.venv/bin/python ringbearer.py probe           # dry run — exercises auth + MCP + logging
+.venv/bin/python ringbearer.py probe --live    # actually sends one real message
 ```
 
 `probe` connects exactly like the phone would (same transport, same auth), so
@@ -88,7 +88,7 @@ fix server, network, or token. Set `BRIDGE_URL` to probe a remote install.
 
 Under Index settings → MCP servers:
 
-- **URL:** `http://<host>:8787/bridge/mcp` — transport **Streamable**
+- **URL:** `http://<host>:8787/ringbearer/mcp` — transport **Streamable**
 - **Header:** `Authorization: Bearer <BRIDGE_TOKEN>`
 - **Server name: no spaces.** The app sanitizes names for the LLM but
   dispatches tool calls on the original name, so a space breaks the round trip
@@ -101,7 +101,7 @@ Under Index settings → MCP servers:
 ## Running it as a service (macOS)
 
 [`ringbearer.plist.example`](ringbearer.plist.example) is a launchd user-agent
-template — it just runs `bridge.py run` (host and port come from `.env`), so
+template — it just runs `ringbearer.py run` (host and port come from `.env`), so
 the only thing to edit is your checkout path. Create the log directory first
 (`mkdir -p logs` — launchd won't create it), then copy to
 `~/Library/LaunchAgents/` and `launchctl load`.
@@ -111,7 +111,7 @@ Two macOS traps it already accounts for:
 - The checkout must **not** live under `~/Documents`, `~/Desktop`, or
   `~/Downloads` — TCC blocks launchd agents from reading those.
 - Pyrogram anchors its session file to the *launching script's* directory
-  (`.venv/bin` under uvicorn); `bridge.py` pins `workdir` to its own directory
+  (`.venv/bin` under uvicorn); `ringbearer.py` pins `workdir` to its own directory
   so the session `login` writes is the one the server finds.
 
 ## Security notes

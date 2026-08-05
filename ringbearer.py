@@ -16,17 +16,17 @@ a bot you wrote yourself.
 
 Quick start — one command, one loop:
 
-  python bridge.py      first run: collects every secret, logs into Telegram,
+  python ringbearer.py      first run: collects every secret, logs into Telegram,
                         starts the server. Every run after: just starts the
                         server. It resumes from whatever state exists on disk.
 
 Pieces, if you ever need one alone:
 
-  python bridge.py setup    collect secrets, write .env
-  python bridge.py login    (re)create the Telegram session
-  python bridge.py run      start the server only — non-interactive by design,
+  python ringbearer.py setup    collect secrets, write .env
+  python ringbearer.py login    (re)create the Telegram session
+  python ringbearer.py run      start the server only — non-interactive by design,
                             so launchd/systemd can never hang on a prompt
-  python bridge.py probe    client-side diagnostic: connect like the phone
+  python ringbearer.py probe    client-side diagnostic: connect like the phone
                             would and call the tool (dry run; --live sends)
 
 Endpoints:
@@ -65,6 +65,33 @@ HERE = Path(__file__).parent
 CAPTURES = HERE / "captures.jsonl"
 DRY_RUN_PREFIX = "DRYRUN:"
 
+# Terminal color helpers — plain when piped or NO_COLOR is set.
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _sgr(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if _COLOR else s
+
+
+def bold(s: str) -> str:
+    return _sgr("1", s)
+
+
+def dim(s: str) -> str:
+    return _sgr("2", s)
+
+
+def green(s: str) -> str:
+    return _sgr("32", s)
+
+
+def yellow(s: str) -> str:
+    return _sgr("1;33", s)
+
+
+def cyan(s: str) -> str:
+    return _sgr("1;36", s)
+
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
 TELEGRAM_ENABLED = os.environ.get("TELEGRAM_ENABLED", "false").lower() == "true"
 # @username, or a bare numeric chat id. Pyrogram resolves a digits-only STRING
@@ -78,7 +105,7 @@ if TG_API_ID and not TG_API_ID.isdigit():
     sys.exit(f"TG_API_ID in .env is not a number — edit {HERE / '.env'}")
 TG_API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_NAME = os.environ.get("SESSION_NAME", "ringbearer")
-MCP_MOUNT = os.environ.get("MCP_MOUNT", "/bridge")
+MCP_MOUNT = os.environ.get("MCP_MOUNT", "/ringbearer")
 BIND_HOST = os.environ.get("BIND_HOST", "")
 try:
     BIND_PORT = int(os.environ.get("BIND_PORT", "8787"))
@@ -99,7 +126,7 @@ def make_tg_client():
 
     # workdir is pinned to this file's directory: Pyrogram otherwise anchors the
     # session to Path(sys.argv[0]).parent, which is .venv/bin under uvicorn — the
-    # session written by `bridge.py login` would be invisible to the server.
+    # session written by `ringbearer.py login` would be invisible to the server.
     return Client(
         SESSION_NAME,
         api_id=int(TG_API_ID),
@@ -227,18 +254,18 @@ async def lifespan(app: FastAPI):
     if not BRIDGE_TOKEN:
         raise RuntimeError(
             "BRIDGE_TOKEN is not set — refusing to start unauthenticated. "
-            "First run? python bridge.py setup"
+            "First run? python ringbearer.py setup"
         )
     if TELEGRAM_ENABLED:
         if not (TG_API_ID and TG_API_HASH and ASSISTANT_CHAT):
             raise RuntimeError(
                 "TELEGRAM_ENABLED but TG_API_ID/TG_API_HASH/ASSISTANT_CHAT missing "
-                "— run: python bridge.py setup"
+                "— run: python ringbearer.py setup"
             )
         if not (HERE / f"{SESSION_NAME}.session").exists():
             raise RuntimeError(
                 f"TELEGRAM_ENABLED but no {SESSION_NAME}.session found "
-                "— run: python bridge.py login"
+                "— run: python ringbearer.py login"
             )
         tg_client = make_tg_client()
         await tg_client.start()
@@ -293,7 +320,7 @@ async def healthz():
 def login() -> None:
     """One-time interactive Pyrogram login; creates the session file."""
     if not (TG_API_ID and TG_API_HASH):
-        sys.exit("Set TG_API_ID and TG_API_HASH in .env first (python bridge.py setup)")
+        sys.exit("Set TG_API_ID and TG_API_HASH in .env first (python ringbearer.py setup)")
     # Refuse while the server is up: two Pyrogram clients on one session file
     # can trigger AUTH_KEY_DUPLICATED and get the Telegram session revoked.
     s = socket.socket()
@@ -312,7 +339,7 @@ def login() -> None:
     client = make_tg_client()
     client.start()
     me = client.get_me()
-    print(f"\nLogged in as {me.first_name} (@{me.username}) — session saved as {SESSION_NAME}.session")
+    print(green(f"\nLogged in as {me.first_name} (@{me.username}) — session saved as {SESSION_NAME}.session"))
     client.stop()
 
 
@@ -339,33 +366,33 @@ def setup() -> None:
             if not raw and default is not None:
                 return default
             if not raw:
-                print("     (required — this one can't be blank)")
+                print(dim("     (required — this one can't be blank)"))
                 continue
             if numeric and not raw.lstrip("-").isdigit():
-                print("     (must be a number)")
+                print(dim("     (must be a number)"))
                 continue
             return raw
 
-    print("ringbearer setup — five questions, about three minutes.\n")
+    print(bold("ringbearer setup") + " — five questions, about three minutes.\n")
 
     token = secrets.token_urlsafe(32)
-    print("1. Bridge token — generated for you:")
-    print(f"     {token}")
+    print(cyan("1. Bridge token") + " — generated for you:")
+    print(f"     {yellow(token)}")
     print("   The Pebble app must send it as the header 'Authorization: Bearer <token>'.\n")
 
-    print("2. Telegram API credentials — create an app at https://my.telegram.org/apps")
+    print(cyan("2. Telegram API credentials") + " — create an app at https://my.telegram.org/apps")
     print("   (any app name works; you only need the two values):")
     api_id = ask("     TG_API_ID: ", numeric=True)
     api_hash = ask("     TG_API_HASH: ")
 
-    print("\n3. The Telegram chat your assistant lives in — the DM transcripts should land in:")
+    print("\n" + cyan("3. The Telegram chat your assistant lives in") + " — the DM transcripts should land in:")
     chat = ask("     ASSISTANT_CHAT (@botusername or chat id): ")
 
-    print("\n4. Your assistant's name — becomes the MCP tool name the ring app's LLM sees")
+    print("\n" + cyan("4. Your assistant's name") + " — becomes the MCP tool name the ring app's LLM sees")
     print("   (e.g. 'Hermes' -> send_to_hermes):")
     name = ask("     ASSISTANT_NAME [assistant]: ", default="assistant")
 
-    print("\n5. Where should the server listen? Give the IP your phone can reach")
+    print("\n" + cyan("5. Where should the server listen?") + " Give the IP your phone can reach")
     print("   this machine at:")
     print("   - Tailscale IP (100.x.x.x) — recommended: works from anywhere, and")
     print("     the port is never visible to your LAN or the internet.")
@@ -380,8 +407,8 @@ def setup() -> None:
             _s.close()
             break
         except OSError:
-            print("     (this machine can't bind that address — is Tailscale up?")
-            print("      `ifconfig` shows what's available)")
+            print(dim("     (this machine can't bind that address — is Tailscale up?"))
+            print(dim("      `ifconfig` shows what's available)"))
     port = ask("     BIND_PORT [8787]: ", default="8787", numeric=True)
 
     # Restricted from birth: no umask-default window with the token inside.
@@ -397,10 +424,10 @@ def setup() -> None:
         f"BIND_PORT={port}\n"
         "SESSION_NAME=ringbearer\n"
         "# RING_PREFIX=\U0001f3a4   # prefix on relayed messages\n"
-        "# MCP_MOUNT=/bridge   # MCP endpoint becomes <MCP_MOUNT>/mcp\n"
+        "# MCP_MOUNT=/ringbearer   # MCP endpoint becomes <MCP_MOUNT>/mcp\n"
     )
     env_path.chmod(0o600)
-    print(f"\nWrote {env_path} (mode 600).")
+    print(green(f"\nWrote {env_path} (mode 600)."))
     print_phone_settings(host, port, token)
 
 
@@ -435,11 +462,11 @@ def check_bindable(host: str) -> None:
 
 
 def print_phone_settings(host: str, port: str, token: str) -> None:
-    print("\nPebble app settings (Index settings → MCP servers) — reprint any time")
-    print("with `python bridge.py setup`:")
-    print(f"  URL:     http://{host}:{port}{MCP_MOUNT}/mcp   (transport: Streamable)")
-    print(f"  Header:  Authorization: Bearer {token}")
-    print("  Name:    anything WITHOUT spaces (a space breaks tool dispatch)")
+    print(bold("\nPebble app settings") + " (Index settings → MCP servers)")
+    print(dim("  — reprint any time with `python ringbearer.py setup`"))
+    print(f"  URL:     {yellow(f'http://{host}:{port}{MCP_MOUNT}/mcp')}   (transport: Streamable)")
+    print(f"  Header:  {yellow(f'Authorization: Bearer {token}')}")
+    print("  Name:    anything " + bold("WITHOUT spaces") + " (a space breaks tool dispatch)")
     print("  Group:   model type Default, then Secondary Mode → MCP Sandbox → pick the group.")
 
 
@@ -447,7 +474,7 @@ def incomplete_env_exit(missing: list[str]) -> None:
     sys.exit(
         f".env is incomplete — missing: {', '.join(missing)}.\n"
         f"Edit {HERE / '.env'} (see .env.example), or delete it and rerun "
-        "`python bridge.py` to redo setup."
+        "`python ringbearer.py` to redo setup."
     )
 
 
@@ -458,15 +485,17 @@ def run() -> None:
     if missing:
         incomplete_env_exit(missing)
     if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
-        sys.exit(f"No {SESSION_NAME}.session — run: python bridge.py login")
+        sys.exit(f"No {SESSION_NAME}.session — run: python ringbearer.py login")
     check_bindable(BIND_HOST)
     import uvicorn
 
-    print(f"ringbearer → http://{BIND_HOST}:{BIND_PORT}{MCP_MOUNT}/mcp")
+    print(bold(f"ringbearer → http://{BIND_HOST}:{BIND_PORT}{MCP_MOUNT}/mcp"))
     if not TELEGRAM_ENABLED:
         print(
-            "WARNING: TELEGRAM_ENABLED=false — captures are logged to "
-            "captures.jsonl only, NOT delivered to Telegram.",
+            yellow(
+                "WARNING: TELEGRAM_ENABLED=false — captures are logged to "
+                "captures.jsonl only, NOT delivered to Telegram."
+            ),
             flush=True,
         )
     uvicorn.run(app, host=BIND_HOST, port=BIND_PORT)
@@ -519,7 +548,7 @@ def first_run(fresh: bool = False) -> None:
         if not sys.stdin.isatty():
             sys.exit(
                 "No .env yet, and no terminal to ask questions in — run "
-                "`python bridge.py` interactively once (or see .env.example)."
+                "`python ringbearer.py` interactively once (or see .env.example)."
             )
         setup()
         # Re-exec so the fresh .env is loaded cleanly, then the loop continues
@@ -527,14 +556,14 @@ def first_run(fresh: bool = False) -> None:
         # process image, and a piped stdout would silently lose the settings.
         # --fresh tells the next image this is still the first run.
         sys.stdout.flush()
-        os.execv(sys.executable, [sys.executable, str(HERE / "bridge.py"), "--fresh"])
+        os.execv(sys.executable, [sys.executable, str(HERE / "ringbearer.py"), "--fresh"])
     missing = required_missing()
     if missing:
         incomplete_env_exit(missing)
     just_logged_in = False
     if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
         if not sys.stdin.isatty():
-            sys.exit(f"No {SESSION_NAME}.session — run: python bridge.py login")
+            sys.exit(f"No {SESSION_NAME}.session — run: python ringbearer.py login")
         print("One more thing: Telegram login.\n")
         login()
         just_logged_in = True
@@ -547,7 +576,7 @@ def first_run(fresh: bool = False) -> None:
         print()
         # And make clear the foreground server is the TEST posture, plus how
         # to graduate it to a real service.
-        print("Starting the server in THIS terminal so you can watch it work —")
+        print(bold("Starting the server in THIS terminal") + " so you can watch it work —")
         print("double-click your ring and the tool call will log below. Ctrl-C stops it.")
         print("To run it permanently as a background service instead (macOS):")
         print("  mkdir -p logs")
@@ -576,4 +605,4 @@ if __name__ == "__main__":
         else:
             print(__doc__)
     except (EOFError, KeyboardInterrupt):
-        sys.exit("\nCancelled. Rerun `python bridge.py` when ready.")
+        sys.exit("\nCancelled. Rerun `python ringbearer.py` when ready.")

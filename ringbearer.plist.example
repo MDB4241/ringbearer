@@ -3,7 +3,7 @@
 <!--
   launchd user agent for macOS. The only edit needed: replace
   /Users/YOU/ringbearer with your checkout path everywhere — host and port
-  come from .env (`bridge.py run` reads them, and fails fast with a named
+  come from .env (`ringbearer.py run` reads them, and fails fast with a named
   fix instead of prompting if anything is missing).
 
   NOTE: the checkout must NOT live under ~/Documents, ~/Desktop, or
@@ -22,7 +22,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/Users/YOU/ringbearer/.venv/bin/python</string>
-        <string>/Users/YOU/ringbearer/bridge.py</string>
+        <string>/Users/YOU/ringbearer/ringbearer.py</string>
         <string>run</string>
     </array>
     <key>WorkingDirectory</key>
