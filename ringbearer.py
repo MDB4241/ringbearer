@@ -61,6 +61,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from mcp.server import MCPServer
 
+# Keep the room quiet: Pyrogram narrates every connection ("NetworkTask
+# started", "14 HandlerTasks") and the MCP SDK logs "Terminating session"
+# per stateless request — noise that buries the output that matters.
+import logging
+
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("mcp").setLevel(logging.WARNING)
+
 load_dotenv()
 
 HERE = Path(__file__).parent
@@ -341,7 +349,8 @@ def login() -> None:
     client = make_tg_client()
     client.start()
     me = client.get_me()
-    print(green(f"\nLogged in as {me.first_name} (@{me.username}) — session saved as {SESSION_NAME}.session"))
+    handle = f"@{me.username}" if me.username else "no public username"
+    print(green(f"\nLogged in as {me.first_name} ({handle}) — session saved as {SESSION_NAME}.session"))
     client.stop()
     # The session file IS the Telegram account — Pyrogram creates it at the
     # umask default (644); pull it to owner-only like .env and captures.jsonl.
