@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd user agent for macOS. Replace /Users/YOU/ring-bridge with your
+  checkout path and LISTEN_IP with the IP the phone reaches (your Tailscale
+  IP if you use a tailnet — recommended — otherwise a LAN IP).
+
+  NOTE: the checkout must NOT live under ~/Documents, ~/Desktop, or
+  ~/Downloads — macOS TCC blocks launchd agents from reading those. ~/Projects
+  or similar works.
+
+  Install:
+    cp ring-bridge.plist.example ~/Library/LaunchAgents/com.YOU.ring-bridge.plist
+    launchctl load ~/Library/LaunchAgents/com.YOU.ring-bridge.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.YOU.ring-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOU/ring-bridge/.venv/bin/uvicorn</string>
+        <string>bridge:app</string>
+        <string>--host</string>
+        <string>LISTEN_IP</string>
+        <string>--port</string>
+        <string>8787</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/YOU/ring-bridge</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOU/ring-bridge/logs/bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOU/ring-bridge/logs/bridge.error.log</string>
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Aqua</string>
+        <string>Background</string>
+    </array>
+</dict>
+</plist>

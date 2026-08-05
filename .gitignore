@@ -1,0 +1,13 @@
+.env
+*.session
+*.session-journal
+captures.jsonl
+.venv/
+__pycache__/
+logs/
+server.log
+.DS_Store
+
+# personal, not part of the public repo
+ISA.md
+LOCAL_NOTES.md
