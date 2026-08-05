@@ -344,8 +344,9 @@ def login() -> None:
             "get your Telegram session revoked."
         )
     print("Log in with YOUR Telegram account — the bridge posts as you.")
-    print("Phone number must be in full international format, e.g. +12025550143")
-    print("(leading + and country code are required — a bare local number is rejected)\n")
+    print("Phone number format: " + bold("+<country code><number>, digits only") + " — e.g. +12025550143")
+    print("(the leading + and country code are required — that's the +1 for the US —")
+    print(" and no hyphens, spaces, or parentheses; a bare local number is rejected)\n")
     client = make_tg_client()
     client.start()
     me = client.get_me()
