@@ -11,6 +11,7 @@
   or similar works.
 
   Install:
+    mkdir -p /Users/YOU/ringbearer/logs
     cp ringbearer.plist.example ~/Library/LaunchAgents/com.YOU.ringbearer.plist
     launchctl load ~/Library/LaunchAgents/com.YOU.ringbearer.plist
 -->

@@ -16,7 +16,7 @@ Telegram like any other conversation. Start something from the ring on a walk,
 finish it on your phone later.
 
 Works with any assistant that lives in a Telegram chat: Hermes, OpenClaw, a
-bot you wrote yourself. ~280 lines of Python — FastAPI, the MCP SDK, Pyrogram.
+bot you wrote yourself. One Python file — FastAPI, the MCP SDK, Pyrogram.
 
 ## How it works
 
@@ -59,16 +59,25 @@ it again any time: it resumes from whatever state exists, which after first
 run just means "start the server."
 
 The pieces also exist standalone when you need one — `bridge.py setup`,
-`bridge.py login` (e.g. after a session revocation), and `bridge.py run`,
-which is non-interactive by design so a service manager can never hang on a
-prompt.
+`bridge.py login` (e.g. after a session revocation), `bridge.py run`
+(non-interactive by design, so a service manager can never hang on a prompt),
+and `bridge.py probe`.
+
+A note on Python versions: tested on 3.13. The Telegram layer, `pyrogram`
+2.0.106, is its author's final release and only declares support through
+3.11 — `bridge.py` carries a small event-loop guard that keeps it working on
+newer interpreters, but future breakage there is possible.
 
 Verify without touching your real DM:
 
 ```bash
-.venv/bin/python test_mcp.py           # dry run — exercises auth + MCP + logging
-.venv/bin/python test_mcp.py --live    # actually sends one probe message
+.venv/bin/python bridge.py probe           # dry run — exercises auth + MCP + logging
+.venv/bin/python bridge.py probe --live    # actually sends one real message
 ```
+
+`probe` connects exactly like the phone would (same transport, same auth), so
+it bisects failures: probe succeeds → fix your phone settings; probe fails →
+fix server, network, or token. Set `BRIDGE_URL` to probe a remote install.
 
 ## Phone settings (Pebble app)
 
@@ -88,8 +97,9 @@ Under Index settings → MCP servers:
 
 [`ringbearer.plist.example`](ringbearer.plist.example) is a launchd user-agent
 template — it just runs `bridge.py run` (host and port come from `.env`), so
-the only thing to edit is your checkout path. Copy to `~/Library/LaunchAgents/`,
-`launchctl load`.
+the only thing to edit is your checkout path. Create the log directory first
+(`mkdir -p logs` — launchd won't create it), then copy to
+`~/Library/LaunchAgents/` and `launchctl load`.
 
 Two macOS traps it already accounts for:
 
@@ -112,6 +122,10 @@ Two macOS traps it already accounts for:
   the same session risks `AUTH_KEY_DUPLICATED` and revocation.
 - **Probes are dry-run by default.** A live probe is a real message your real
   assistant will act on; `--live` is a deliberate flag for that reason.
+- **Captures are also logged locally.** Every transcript is appended verbatim
+  to `captures.jsonl` (created mode 600, gitignored, never rotated) — it's the
+  local record that survives even if Telegram delivery fails. Delete it
+  whenever you like.
 
 ## Design notes
 

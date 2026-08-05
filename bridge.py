@@ -26,6 +26,8 @@ Pieces, if you ever need one alone:
   python bridge.py login    (re)create the Telegram session
   python bridge.py run      start the server only — non-interactive by design,
                             so launchd/systemd can never hang on a prompt
+  python bridge.py probe    client-side diagnostic: connect like the phone
+                            would and call the tool (dry run; --live sends)
 
 Endpoints:
   <MCP_MOUNT>/mcp   MCP server (Streamable HTTP), bearer-token gated.
@@ -58,9 +60,16 @@ from mcp.server import MCPServer
 
 load_dotenv()
 
+HERE = Path(__file__).parent
+CAPTURES = HERE / "captures.jsonl"
+DRY_RUN_PREFIX = "DRYRUN:"
+
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
 TELEGRAM_ENABLED = os.environ.get("TELEGRAM_ENABLED", "false").lower() == "true"
-ASSISTANT_CHAT = os.environ.get("ASSISTANT_CHAT", "")  # @username or chat id of the assistant DM
+# @username, or a bare numeric chat id. Pyrogram resolves a digits-only STRING
+# as a phone number, so numeric ids must be coerced to int to work at all.
+_chat = os.environ.get("ASSISTANT_CHAT", "")
+ASSISTANT_CHAT = int(_chat) if re.fullmatch(r"-?\d+", _chat) else _chat
 ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "assistant")
 RING_PREFIX = os.environ.get("RING_PREFIX", "\U0001f3a4 ")
 TG_API_ID = os.environ.get("TG_API_ID", "")
@@ -68,11 +77,10 @@ TG_API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_NAME = os.environ.get("SESSION_NAME", "ringbearer")
 MCP_MOUNT = os.environ.get("MCP_MOUNT", "/bridge")
 BIND_HOST = os.environ.get("BIND_HOST", "")
-BIND_PORT = int(os.environ.get("BIND_PORT", "8787"))
-
-HERE = Path(__file__).parent
-CAPTURES = HERE / "captures.jsonl"
-DRY_RUN_PREFIX = "DRYRUN:"
+try:
+    BIND_PORT = int(os.environ.get("BIND_PORT", "8787"))
+except ValueError:
+    sys.exit(f"BIND_PORT in .env is not a number — edit {HERE / '.env'}")
 
 # The tool name the ring app's LLM sees, e.g. send_to_hermes. Keep it free of
 # anything but [a-z0-9_]: the app sanitizes names for the LLM but dispatches on
@@ -98,6 +106,7 @@ def make_tg_client():
 
 
 def log_capture(row: dict) -> None:
+    CAPTURES.touch(mode=0o600, exist_ok=True)
     with CAPTURES.open("a") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
@@ -143,18 +152,27 @@ async def send_to_assistant(message: str) -> str:
         return "Dry run: received, not delivered to Telegram."
 
     started = time.monotonic()
-    sent = await deliver(message)
+    err = None
+    try:
+        sent = await deliver(message)
+    except Exception as e:  # the transcript is the only copy — log it no matter what
+        sent, err = False, repr(e)
     send_ms = round((time.monotonic() - started) * 1000)
-    print(f"[mcp] {TOOL_NAME}: telegram {send_ms}ms", flush=True)
-    log_capture({
+    print(f"[mcp] {TOOL_NAME}: telegram {send_ms}ms" + (f" ERROR {err}" if err else ""), flush=True)
+    row = {
         "received_at": datetime.now().astimezone().isoformat(),
         "source": "mcp",
         "transcription": message,
         "forwarded": sent,
         "telegram_ms": send_ms,
-    })
+    }
+    if err:
+        row["error"] = err
+    log_capture(row)
     if sent:
         return f"Delivered. {ASSISTANT_NAME} will reply in Telegram."
+    if err:
+        return f"Logged locally, but Telegram delivery failed: {err}"
     return "Received and logged. (Telegram delivery not yet enabled.)"
 
 
@@ -225,12 +243,17 @@ async def lifespan(app: FastAPI):
         await tg_client.stop()
 
 
-app = FastAPI(lifespan=lifespan)
+# Docs/OpenAPI off: nothing here is browsable, and the README's "everything
+# except /healthz requires the token" claim should be literally true.
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
 def token_ok(authorization: str | None) -> bool:
+    # Compare bytes: compare_digest raises TypeError on non-ASCII str input,
+    # and Starlette decodes headers as latin-1 — a malformed header should be
+    # a clean 401, not a 500.
     return authorization is not None and hmac.compare_digest(
-        authorization, f"Bearer {BRIDGE_TOKEN}"
+        authorization.encode("utf-8", "replace"), f"Bearer {BRIDGE_TOKEN}".encode()
     )
 
 
@@ -291,6 +314,19 @@ def setup() -> None:
             print(f"Currently missing or empty: {', '.join(missing)}")
         return
 
+    def ask(prompt: str, *, default: str | None = None, numeric: bool = False) -> str:
+        while True:
+            raw = input(prompt).strip()
+            if not raw and default is not None:
+                return default
+            if not raw:
+                print("     (required — this one can't be blank)")
+                continue
+            if numeric and not raw.lstrip("-").isdigit():
+                print("     (must be a number)")
+                continue
+            return raw
+
     print("ringbearer setup — five questions, about three minutes.\n")
 
     token = secrets.token_urlsafe(32)
@@ -300,15 +336,15 @@ def setup() -> None:
 
     print("2. Telegram API credentials — create an app at https://my.telegram.org/apps")
     print("   (any app name works; you only need the two values):")
-    api_id = input("     TG_API_ID: ").strip()
-    api_hash = input("     TG_API_HASH: ").strip()
+    api_id = ask("     TG_API_ID: ", numeric=True)
+    api_hash = ask("     TG_API_HASH: ")
 
     print("\n3. The Telegram chat your assistant lives in — the DM transcripts should land in:")
-    chat = input("     ASSISTANT_CHAT (@botusername or chat id): ").strip()
+    chat = ask("     ASSISTANT_CHAT (@botusername or chat id): ")
 
     print("\n4. Your assistant's name — becomes the MCP tool name the ring app's LLM sees")
     print("   (e.g. 'Hermes' -> send_to_hermes):")
-    name = input("     ASSISTANT_NAME [assistant]: ").strip() or "assistant"
+    name = ask("     ASSISTANT_NAME [assistant]: ", default="assistant")
 
     print("\n5. Where should the server listen? Give the IP your phone can reach")
     print("   this machine at:")
@@ -317,8 +353,8 @@ def setup() -> None:
     print("   - LAN IP (192.168.x.x) — works, but only while your phone is on the")
     print("     same network, and anyone on that network can reach the port.")
     print("   Never expose this to the public internet.")
-    host = input("     BIND_HOST: ").strip()
-    port = input("     BIND_PORT [8787]: ").strip() or "8787"
+    host = ask("     BIND_HOST: ")
+    port = ask("     BIND_PORT [8787]: ", default="8787", numeric=True)
 
     env_path.write_text(
         f"BRIDGE_TOKEN={token}\n"
@@ -342,22 +378,81 @@ def setup() -> None:
     print("  Group:   model type Default, then Secondary Mode → MCP Sandbox → pick the group.")
 
 
+def required_missing() -> list[str]:
+    """Names of required .env keys that are empty. A .env can exist and still
+    be unusable (blank answers, hand-edits) — existence is not validity."""
+    missing = [k for k, v in (("BRIDGE_TOKEN", BRIDGE_TOKEN), ("BIND_HOST", BIND_HOST)) if not v]
+    if TELEGRAM_ENABLED:
+        missing += [
+            k for k, v in (
+                ("TG_API_ID", TG_API_ID),
+                ("TG_API_HASH", TG_API_HASH),
+                ("ASSISTANT_CHAT", ASSISTANT_CHAT),
+            ) if not v
+        ]
+    return missing
+
+
+def incomplete_env_exit(missing: list[str]) -> None:
+    sys.exit(
+        f".env is incomplete — missing: {', '.join(missing)}.\n"
+        f"Edit {HERE / '.env'} (see .env.example), or delete it and rerun "
+        "`python bridge.py` to redo setup."
+    )
+
+
 def run() -> None:
     """Start the server. Non-interactive by design (launchd-safe): missing
-    state fails fast naming the command that fixes it — never a prompt."""
-    if not BRIDGE_TOKEN:
-        sys.exit("BRIDGE_TOKEN is not set — run: python bridge.py")
-    if not BIND_HOST:
-        sys.exit("BIND_HOST is not set — run: python bridge.py (or add BIND_HOST to .env)")
-    if TELEGRAM_ENABLED:
-        if not (TG_API_ID and TG_API_HASH and ASSISTANT_CHAT):
-            sys.exit("Telegram config incomplete — run: python bridge.py")
-        if not (HERE / f"{SESSION_NAME}.session").exists():
-            sys.exit(f"No {SESSION_NAME}.session — run: python bridge.py login")
+    state fails fast naming the fix — never a prompt."""
+    missing = required_missing()
+    if missing:
+        incomplete_env_exit(missing)
+    if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
+        sys.exit(f"No {SESSION_NAME}.session — run: python bridge.py login")
     import uvicorn
 
     print(f"ringbearer → http://{BIND_HOST}:{BIND_PORT}{MCP_MOUNT}/mcp")
     uvicorn.run(app, host=BIND_HOST, port=BIND_PORT)
+
+
+def probe(live: bool = False) -> None:
+    """Client-side diagnostic: connect exactly like the phone would —
+    initialize, list tools, call the send tool. Dry run by default; the
+    assistant DM is a live channel and --live sends a real message it will
+    act on. BRIDGE_URL overrides the target (e.g. probing a remote install)."""
+    import logging
+
+    import httpx2
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
+
+    url = os.environ.get("BRIDGE_URL") or (
+        f"http://{BIND_HOST or 'localhost'}:{BIND_PORT}{MCP_MOUNT}/mcp"
+    )
+    text = "bridge probe, no reply needed"
+    message = text if live else f"{DRY_RUN_PREFIX} {text}"
+    print(f"probing {url}" + (" (LIVE)" if live else " (dry run)"))
+
+    async def _probe() -> None:
+        headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
+        async with httpx2.AsyncClient(headers=headers, timeout=15) as http:
+            async with streamable_http_client(url, http_client=http) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = await session.list_tools()
+                    print("tools:", [t.name for t in tools.tools])
+                    result = await session.call_tool(TOOL_NAME, {"message": message})
+                    print("result:", result.content[0].text)
+
+    try:
+        asyncio.run(_probe())
+    except Exception as e:
+        sys.exit(
+            f"FAILED ({type(e).__name__}): {e}\n"
+            "Is the server running, and does BRIDGE_TOKEN match?"
+        )
 
 
 def first_run() -> None:
@@ -371,8 +466,13 @@ def first_run() -> None:
             )
         setup()
         # Re-exec so the fresh .env is loaded cleanly, then the loop continues
-        # from the next missing piece (login).
+        # from the next missing piece (login). Flush first: exec replaces the
+        # process image, and a piped stdout would silently lose the settings.
+        sys.stdout.flush()
         os.execv(sys.executable, [sys.executable, str(HERE / "bridge.py")])
+    missing = required_missing()
+    if missing:
+        incomplete_env_exit(missing)
     if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
         if not sys.stdin.isatty():
             sys.exit(f"No {SESSION_NAME}.session — run: python bridge.py login")
@@ -384,13 +484,18 @@ def first_run() -> None:
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd == "setup":
-        setup()
-    elif cmd == "login":
-        login()
-    elif cmd == "run":
-        run()
-    elif cmd == "":
-        first_run()
-    else:
-        print(__doc__)
+    try:
+        if cmd == "setup":
+            setup()
+        elif cmd == "login":
+            login()
+        elif cmd == "run":
+            run()
+        elif cmd == "probe":
+            probe(live="--live" in sys.argv)
+        elif cmd == "":
+            first_run()
+        else:
+            print(__doc__)
+    except (EOFError, KeyboardInterrupt):
+        sys.exit("\nCancelled. Rerun `python bridge.py` when ready.")
