@@ -83,7 +83,10 @@ Verify without touching your real DM:
 
 `probe` connects exactly like the phone would (same transport, same auth), so
 it bisects failures: probe succeeds → fix your phone settings; probe fails →
-fix server, network, or token. Set `BRIDGE_URL` to probe a remote install.
+fix server, network, or token. Set `BRIDGE_URL` to probe a remote install —
+and note the probe takes its token and tool name from the local config, so
+when the target runs different settings (a container, another machine), point
+`RINGBEARER_STATE_DIR` at that install's state directory too.
 
 ## Docker
 

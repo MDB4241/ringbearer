@@ -833,9 +833,16 @@ def first_run(fresh: bool = False) -> None:
         # to graduate it to a real service.
         print(bold("Starting the server in THIS terminal") + " so you can watch it work —")
         print("double-click your ring and the tool call will log below. Ctrl-C stops it.")
-        print("To run it permanently as a background service instead (macOS, one command):")
-        print("  " + bold("python ringbearer.py service"))
-        print(dim("(Details: README → Running it as a service.)\n"))
+        # The graduation advice depends on where this is running: `service` is
+        # launchd and only exists on a Mac — in a container or on Linux it
+        # would just be a dead end printed at the moment of success.
+        print("To run it permanently in the background instead:")
+        if sys.platform == "darwin":
+            print("  " + bold("python ringbearer.py service") + "   (macOS, one command)")
+        else:
+            print("  Docker: Ctrl-C, then " + bold("docker compose -f docker/compose.yml up -d"))
+            print("  Linux (native): run `ringbearer.py run` under systemd")
+        print(dim("(Details: README → Running it as a service / Docker.)\n"))
     run()
 
 

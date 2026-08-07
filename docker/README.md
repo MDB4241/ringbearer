@@ -1,6 +1,6 @@
 # Docker
 
-Ringbearer's image contains the application. Configuration, the Telegram
+ringbearer's image contains the application. Configuration, the Telegram
 session, and captured transcripts stay in the bind-mounted `data/` directory.
 
 ## Setup
@@ -30,10 +30,9 @@ reachable from other machines on the same local network segment, and on all
 versions Docker's published ports bypass ufw/firewalld rules. The Tailscale
 binding avoids both.
 
-The build keeps your private state out of the build context via
-`Dockerfile.dockerignore`, which only BuildKit honors — the default builder
-since Docker 23. Don't build this with a legacy builder: it would send your
-whole checkout, private state included, to the Docker daemon.
+The repo-root `.dockerignore` whitelists only the three files the image
+needs, so your private state never reaches the Docker daemon as build
+context, on any builder.
 
 Run onboarding inside the container:
 
@@ -80,7 +79,7 @@ from the public internet.
 
 To migrate an existing native installation, stop it first, then copy `.env`,
 all `<SESSION_NAME>.session*` files, and `captures.jsonl` into `docker/data/`.
-Never run native and containerized Ringbearer against the same Telegram
+Never run native and containerized ringbearer against the same Telegram
 session simultaneously.
 
 Deployment systems may render their own `.env` and mount any persistent
