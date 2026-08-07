@@ -2,7 +2,7 @@
 
 > *One does not simply type.*
 
-![Python 3.11+](https://img.shields.io/badge/python-3.11+-3776AB) ![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)
+![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB) ![License: MIT](https://img.shields.io/badge/license-MIT-lightgrey)
 
 Turn the **Pebble Index 01 ring** into a push-to-talk button for your own AI
 assistant, using its Telegram DM as the conversation surface.
@@ -68,7 +68,7 @@ The pieces also exist standalone when you need one — `ringbearer.py setup`,
 (non-interactive by design, so a service manager can never hang on a prompt),
 and `ringbearer.py probe`.
 
-A note on Python versions: tested on 3.11 and 3.13. The Telegram layer is
+A note on Python versions: needs 3.10+, tested on 3.14. The Telegram layer is
 [Telethon](https://docs.telethon.dev), pinned exact — its stable 1.x line has
 been continuously maintained for about a decade (development now lives on
 [Codeberg](https://codeberg.org/Lonami/Telethon); the archived GitHub repo is
