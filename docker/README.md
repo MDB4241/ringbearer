@@ -26,6 +26,11 @@ Edit `docker/compose.yml` or set `RINGBEARER_HOST` to the Docker host interface
 that Pebble should reach. A Tailscale `100.x.x.x` address is recommended. The
 checked-in default, `127.0.0.1`, is intentionally reachable only on the host.
 
+The build keeps your private state out of the build context via
+`Dockerfile.dockerignore`, which only BuildKit honors — the default builder
+since Docker 23. Don't build this with a legacy builder: it would send your
+whole checkout, private state included, to the Docker daemon.
+
 Run onboarding inside the container:
 
 ```bash
