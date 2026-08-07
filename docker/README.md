@@ -24,7 +24,11 @@ normally needed there.
 
 Edit `docker/compose.yml` or set `RINGBEARER_HOST` to the Docker host interface
 that Pebble should reach. A Tailscale `100.x.x.x` address is recommended. The
-checked-in default, `127.0.0.1`, is intentionally reachable only on the host.
+checked-in default, `127.0.0.1`, keeps the port host-only in most setups — but
+on Linux with Docker Engine older than 28, loopback-published ports were
+reachable from other machines on the same local network segment, and on all
+versions Docker's published ports bypass ufw/firewalld rules. The Tailscale
+binding avoids both.
 
 The build keeps your private state out of the build context via
 `Dockerfile.dockerignore`, which only BuildKit honors — the default builder
@@ -37,10 +41,11 @@ Run onboarding inside the container:
 docker compose -f docker/compose.yml run --rm --service-ports ringbearer
 ```
 
-Enter `0.0.0.0` for `BIND_HOST`: that is the listener inside the container.
-Configure Pebble with the host address selected above, not `0.0.0.0`. Setup
-writes `.env`, the Telegram login writes `ringbearer.session`, and delivery
-writes `captures.jsonl`; all remain under `docker/data/`.
+Setup takes the listen address from the container's environment (`0.0.0.0`,
+the listener inside the container) and skips that question. Configure Pebble
+with the host address selected above, not `0.0.0.0`. Setup writes `.env`, the
+Telegram login writes `ringbearer.session`, and delivery writes
+`captures.jsonl`; all remain under `docker/data/`.
 
 Test the foreground bridge, press Ctrl-C, then start it in the background:
 
@@ -73,9 +78,10 @@ from the public internet.
 
 ## Existing state and deployment systems
 
-To migrate an existing native installation, stop it first, then copy `.env`
-and all `<SESSION_NAME>.session*` files into `docker/data/`. Never run native
-and containerized Ringbearer against the same Telegram session simultaneously.
+To migrate an existing native installation, stop it first, then copy `.env`,
+all `<SESSION_NAME>.session*` files, and `captures.jsonl` into `docker/data/`.
+Never run native and containerized Ringbearer against the same Telegram
+session simultaneously.
 
 Deployment systems may render their own `.env` and mount any persistent
 directory at `/data`; Compose is only an example.
@@ -87,7 +93,12 @@ make public-internet exposure safe.
 ## Troubleshooting
 
 - Permission denied under `/data`: apply the narrowly scoped ownership command
-  from Setup, then retry onboarding.
+  from Setup, then retry onboarding. On SELinux-enforcing hosts (Fedora/RHEL),
+  also add `:Z` to the volume line: `./data:/data:Z` — ownership alone won't
+  clear a label denial.
+- Container restarts repeatedly with "No .env yet" in the logs: you ran
+  `up -d` before onboarding. Run the interactive onboarding command from
+  Setup first.
 - Healthy but unreachable: replace the loopback publication with the host's
   Tailscale or LAN address and use that same address in Pebble.
 - Port binding failure: confirm the selected address exists on the Docker host.

@@ -168,7 +168,9 @@ if it lands, this gets even simpler.
 ## Configuration
 
 Configuration comes from the process environment and `.env` (see
-[`.env.example`](.env.example)):
+[`.env.example`](.env.example)). The process environment wins: a variable
+already set when the server starts (as the Docker image does for
+`BIND_HOST`/`BIND_PORT`) is not overridden by the same key in `.env`:
 
 | Variable | Meaning |
 |---|---|
@@ -181,7 +183,7 @@ Configuration comes from the process environment and `.env` (see
 | `SESSION_NAME` | Telegram session file name (default `ringbearer`) |
 | `RING_PREFIX` | Prefix on relayed messages (default 🎤) |
 | `MCP_MOUNT` | Mount path; endpoint is `<MCP_MOUNT>/mcp` (default `/ringbearer`) |
-| `RINGBEARER_STATE_DIR` | Directory for `.env`, Telegram session files, and captures (process environment only; defaults to this checkout) |
+| `RINGBEARER_STATE_DIR` | Absolute directory for `.env`, Telegram session files, and captures (process environment only; defaults to this checkout). `service` bakes it into the launchd plist. |
 
 ## License
 

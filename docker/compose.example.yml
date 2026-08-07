@@ -1,8 +1,15 @@
+# Without an explicit name, the project would be named after this directory
+# ("docker") and collide with any other repo doing the same.
+name: ringbearer
+
 services:
   ringbearer:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    # The container always listens on 8787; to change the outside port,
+    # remap the HOST side of `ports:` below. Changing BIND_PORT instead
+    # would break the healthcheck, which probes 8787 inside the container.
     environment:
       BIND_HOST: 0.0.0.0
       BIND_PORT: 8787

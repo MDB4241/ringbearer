@@ -71,8 +71,13 @@ HERE = Path(__file__).parent
 # RINGBEARER_STATE_DIR when set — the seam that keeps a Docker image
 # disposable while user data persists. Unset, it IS the checkout, and nothing
 # changes for native installs. Process environment only, never .env: this
-# value decides where .env is.
-STATE_DIR = Path(os.environ.get("RINGBEARER_STATE_DIR", HERE)).expanduser().resolve()
+# value decides where .env is. Must be absolute — a relative path would move
+# with the launching directory, silently splitting state between cwds; empty
+# means unset, not cwd.
+_state_raw = os.environ.get("RINGBEARER_STATE_DIR", "").strip()
+if _state_raw and not Path(_state_raw).expanduser().is_absolute():
+    sys.exit(f"RINGBEARER_STATE_DIR must be an absolute path (got: {_state_raw!r})")
+STATE_DIR = (Path(_state_raw).expanduser() if _state_raw else HERE).resolve()
 load_dotenv(STATE_DIR / ".env")
 
 CAPTURES = STATE_DIR / "captures.jsonl"
@@ -128,6 +133,10 @@ SESSION_NAME = os.environ.get("SESSION_NAME", "ringbearer")
 # chmod (checks would look for name.session.session). Normalize once here.
 if SESSION_NAME.endswith(".session"):
     SESSION_NAME = SESSION_NAME[: -len(".session")]
+# A bare file name only: a separator or dot-dot would silently escape
+# STATE_DIR's containment promise (Path("/data") / "/tmp/x" IS /tmp/x).
+if "/" in SESSION_NAME or SESSION_NAME in ("", ".", ".."):
+    sys.exit(f"SESSION_NAME must be a bare file name, not a path (got: {SESSION_NAME!r})")
 MCP_MOUNT = os.environ.get("MCP_MOUNT", "/ringbearer")
 BIND_HOST = os.environ.get("BIND_HOST", "")
 try:
@@ -429,6 +438,7 @@ def login() -> None:
         # Pre-create the session file owner-only: Telethon would otherwise
         # create it at the umask default, leaving the account-bearing file
         # world-readable for the whole interactive window below.
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         (STATE_DIR / f"{SESSION_NAME}.session").touch(mode=0o600, exist_ok=True)
         # Client construction and use stay inside one event loop — Telethon
         # binds the client to the loop it was created under. Construction
@@ -505,24 +515,33 @@ def setup() -> None:
     print("   (e.g. 'Hermes' -> send_to_hermes):")
     name = ask("     ASSISTANT_NAME [assistant]: ", default="assistant")
 
-    print("\n" + cyan("5. Where should the server listen?") + " Give the IP your phone can reach")
-    print("   this machine at:")
-    print("   - Tailscale IP (100.x.x.x) — recommended: works from anywhere, and")
-    print("     the port is never visible to your LAN or the internet.")
-    print("   - LAN IP (192.168.x.x) — works, but only while your phone is on the")
-    print("     same network, and anyone on that network can reach the port.")
-    print("   Never expose this to the public internet.")
-    while True:
-        host = ask("     BIND_HOST: ")
-        try:
-            _s = socket.socket()
-            _s.bind((host, 0))
-            _s.close()
-            break
-        except OSError:
-            print(dim("     (this machine can't bind that address — is Tailscale up?"))
-            print(dim("      `ifconfig` shows what's available)"))
-    port = ask("     BIND_PORT [8787]: ", default="8787", numeric=True)
+    # A container (or any wrapper) bakes BIND_HOST/BIND_PORT into the process
+    # environment, and the environment beats .env at runtime — asking here
+    # would collect an answer that could never take effect. Skip the question
+    # and say where the values came from.
+    if os.environ.get("BIND_HOST"):
+        host = os.environ["BIND_HOST"]
+        port = os.environ.get("BIND_PORT", "8787")
+        print("\n" + cyan("5. Listen address") + f" — already set by the environment: {host}:{port}")
+    else:
+        print("\n" + cyan("5. Where should the server listen?") + " Give the IP your phone can reach")
+        print("   this machine at:")
+        print("   - Tailscale IP (100.x.x.x) — recommended: works from anywhere, and")
+        print("     the port is never visible to your LAN or the internet.")
+        print("   - LAN IP (192.168.x.x) — works, but only while your phone is on the")
+        print("     same network, and anyone on that network can reach the port.")
+        print("   Never expose this to the public internet.")
+        while True:
+            host = ask("     BIND_HOST: ")
+            try:
+                _s = socket.socket()
+                _s.bind((host, 0))
+                _s.close()
+                break
+            except OSError:
+                print(dim("     (this machine can't bind that address — is Tailscale up?"))
+                print(dim("      `ifconfig` shows what's available)"))
+        port = ask("     BIND_PORT [8787]: ", default="8787", numeric=True)
 
     # Restricted from birth: no umask-default window with the token inside.
     env_path.touch(mode=0o600)
@@ -577,6 +596,12 @@ def check_bindable(host: str) -> None:
 def print_phone_settings(host: str, port: str, token: str) -> None:
     print(bold("\nPebble app settings") + " (Index settings → MCP servers)")
     print(dim("  — reprint any time with `python ringbearer.py setup`"))
+    if host == "0.0.0.0":
+        # The listener answers on every interface, but the phone needs a real
+        # address to dial — in Docker, the address the port is published on.
+        host = "<this-machine's-address>"
+        print(dim("  (0.0.0.0 is the listener, not a dialable address — in Docker, use"))
+        print(dim("   the host address you published the port on)"))
     print(f"  URL:     {yellow(f'http://{host}:{port}{MCP_MOUNT}/mcp')}   (transport: Streamable)")
     print(f"  Header:  {yellow(f'Authorization: Bearer {token}')}")
     print("  Name:    anything " + bold("WITHOUT spaces") + " (a space breaks tool dispatch)")
@@ -660,6 +685,17 @@ def render_plist(label: str) -> str:
     if not python.exists():
         python = Path(sys.executable)
     logs = HERE / "logs"
+    # launchd does NOT inherit the installing shell's environment: without
+    # this block a custom RINGBEARER_STATE_DIR would silently revert to the
+    # checkout inside the agent — no .env found, KeepAlive crash loop.
+    env_block = ""
+    if STATE_DIR != HERE.resolve():
+        env_block = f"""    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RINGBEARER_STATE_DIR</key>
+        <string>{STATE_DIR}</string>
+    </dict>
+"""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -674,7 +710,7 @@ def render_plist(label: str) -> str:
     </array>
     <key>WorkingDirectory</key>
     <string>{HERE}</string>
-    <key>RunAtLoad</key>
+{env_block}    <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
@@ -713,11 +749,12 @@ def service(uninstall: bool = False) -> None:
         return
 
     for blocked in ("Documents", "Desktop", "Downloads"):
-        if Path.home() / blocked in HERE.parents:
-            sys.exit(
-                f"This checkout lives under ~/{blocked}, which launchd agents can't read\n"
-                "(macOS TCC). Move it somewhere like ~/Projects and rerun."
-            )
+        for d, what in ((HERE.resolve(), "checkout"), (STATE_DIR, "state directory")):
+            if Path.home() / blocked in d.parents:
+                sys.exit(
+                    f"The {what} lives under ~/{blocked}, which launchd agents can't read\n"
+                    "(macOS TCC). Move it somewhere like ~/Projects and rerun."
+                )
     missing = required_missing()
     if missing:
         incomplete_env_exit(missing)
@@ -823,3 +860,9 @@ if __name__ == "__main__":
             print(__doc__)
     except (EOFError, KeyboardInterrupt):
         sys.exit("\nCancelled. Rerun `python ringbearer.py` when ready.")
+    except PermissionError as e:
+        sys.exit(
+            f"Permission denied: {e}\n"
+            f"Can this user write {STATE_DIR}? In Docker, see docker/README.md "
+            "→ Troubleshooting (bind-mount ownership)."
+        )
