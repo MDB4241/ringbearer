@@ -121,8 +121,10 @@ template, and `ringbearer.py run` under systemd works the same way.
 Releases before the Telethon migration used Pyrogram for the Telegram layer;
 the two session formats are incompatible. After pulling: reinstall
 dependencies (`.venv/bin/pip install -r requirements.txt`), delete the old
-`ringbearer.session`, and run `python ringbearer.py login` once. Everything
-else — `.env`, phone settings, endpoints — carries over untouched.
+session file (`ringbearer.session`, unless you changed `SESSION_NAME`), and
+run `.venv/bin/python ringbearer.py login` once. Everything else — `.env`,
+phone settings, endpoints — carries over untouched. If the server starts
+before you've done this, it refuses with exactly this fix named.
 
 ## Security notes
 
@@ -164,7 +166,7 @@ All via `.env` (see [`.env.example`](.env.example)):
 |---|---|
 | `BRIDGE_TOKEN` | Bearer token the phone must send (setup generates one) |
 | `TELEGRAM_ENABLED` | `true` to actually deliver; `false` = log-only mode |
-| `ASSISTANT_CHAT` | `@botusername` or chat id of the assistant DM |
+| `ASSISTANT_CHAT` | `@botusername` of the assistant DM (recommended; a numeric chat id works only for chats this account's session has already seen — the server verifies at startup) |
 | `ASSISTANT_NAME` | Display name; becomes the tool name (`Hermes` → `send_to_hermes`) |
 | `TG_API_ID` / `TG_API_HASH` | Telegram API credentials (my.telegram.org) |
 | `BIND_HOST` / `BIND_PORT` | Listen address — the IP your phone can reach (default port `8787`) |

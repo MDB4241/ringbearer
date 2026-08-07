@@ -102,9 +102,12 @@ def cyan(s: str) -> str:
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
 TELEGRAM_ENABLED = os.environ.get("TELEGRAM_ENABLED", "false").lower() == "true"
 # @username, or a bare numeric chat id. A digits-only STRING gets resolved as
-# a phone number, so numeric ids must be coerced to int — and Telethon resolves
-# a bare int only for chats this account has already seen (any DM actually in
-# use qualifies; its entity is in the session cache). @username always works.
+# a phone number, so numeric ids are coerced to int. Numeric ids are best-
+# effort in Telethon — they resolve only from the session file's own entity
+# cache, which starts EMPTY after a fresh login (using the chat in the
+# official apps populates nothing here). The server therefore resolves the
+# chat once at startup and fails fast with advice, instead of failing on
+# every send. @username always works.
 _chat = os.environ.get("ASSISTANT_CHAT", "")
 ASSISTANT_CHAT = int(_chat) if re.fullmatch(r"-?\d+", _chat) else _chat
 ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "assistant")
@@ -114,6 +117,11 @@ if TG_API_ID and not TG_API_ID.isdigit():
     sys.exit(f"TG_API_ID in .env is not a number — edit {HERE / '.env'}")
 TG_API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_NAME = os.environ.get("SESSION_NAME", "ringbearer")
+# Telethon appends ".session" only when the name lacks it — a name already
+# carrying the suffix would desync every existence check and the post-login
+# chmod (checks would look for name.session.session). Normalize once here.
+if SESSION_NAME.endswith(".session"):
+    SESSION_NAME = SESSION_NAME[: -len(".session")]
 MCP_MOUNT = os.environ.get("MCP_MOUNT", "/ringbearer")
 BIND_HOST = os.environ.get("BIND_HOST", "")
 try:
@@ -128,6 +136,7 @@ ASSISTANT_SLUG = re.sub(r"[^a-z0-9_]+", "_", ASSISTANT_NAME.lower()).strip("_") 
 TOOL_NAME = f"send_to_{ASSISTANT_SLUG}"
 
 tg_client = None
+assistant_entity = None  # resolved once at startup; see lifespan
 
 
 def make_tg_client():
@@ -152,7 +161,13 @@ def log_capture(row: dict) -> None:
 async def deliver(message: str) -> bool:
     """Post into the assistant DM as the user. Returns True if actually sent."""
     if TELEGRAM_ENABLED and tg_client is not None:
-        await tg_client.send_message(ASSISTANT_CHAT, f"{RING_PREFIX}{message}")
+        # parse_mode=None: the transcript is a promise ("verbatim and in
+        # full"), so *, _, ` and [] must arrive as characters, not formatting.
+        await tg_client.send_message(
+            assistant_entity if assistant_entity is not None else ASSISTANT_CHAT,
+            f"{RING_PREFIX}{message}",
+            parse_mode=None,
+        )
         return True
     return False
 
@@ -275,19 +290,43 @@ async def lifespan(app: FastAPI):
                 f"TELEGRAM_ENABLED but no {SESSION_NAME}.session found "
                 "— run: python ringbearer.py login"
             )
-        tg_client = make_tg_client()
+        from telethon.errors import FloodWaitError
+
+        # Constructing the client OPENS the session database — a Pyrogram-era
+        # file at the same path dies right here with an sqlite error, so the
+        # migration advice must wrap construction, not just connect().
+        try:
+            tg_client = make_tg_client()
+        except Exception as e:
+            raise RuntimeError(
+                f"Can't open {SESSION_NAME}.session ({type(e).__name__}: {e}).\n"
+                f"If it predates the Telethon migration (Pyrogram), delete it "
+                f"and run: python ringbearer.py login"
+            ) from e
         # connect(), never start(): start() would prompt for a phone number on
         # an unauthorized session, and this path must stay launchd-safe. A bad
         # session fails fast with the fix named instead of a crash-loop
         # traceback (or worse, a silent hang on a prompt no one will answer).
+        # Bounded like deliver(): a half-open connection must not leave the
+        # lifespan pending forever with /healthz never binding.
         try:
-            await tg_client.connect()
-            authorized = await tg_client.is_user_authorized()
+            await asyncio.wait_for(tg_client.connect(), timeout=30)
+            authorized = await asyncio.wait_for(
+                tg_client.is_user_authorized(), timeout=30
+            )
+        except FloodWaitError as e:
+            # Rate limiting is NOT a broken session — advising deletion here
+            # would destroy a healthy login during a restart storm.
+            raise RuntimeError(
+                f"Telegram is rate-limiting this account (FloodWait: retry in "
+                f"{e.seconds}s). The session is healthy — do NOT delete it; "
+                "wait and restart."
+            ) from e
         except Exception as e:
             raise RuntimeError(
                 f"Telegram client failed to connect ({type(e).__name__}: {e}).\n"
-                f"If {SESSION_NAME}.session predates the Telethon migration or "
-                f"was revoked, delete it and run: python ringbearer.py login"
+                f"If {SESSION_NAME}.session was revoked, delete it and run: "
+                "python ringbearer.py login"
             ) from e
         if not authorized:
             raise RuntimeError(
@@ -295,6 +334,23 @@ async def lifespan(app: FastAPI):
                 "terminated, or written by a different library) — delete it "
                 "and run: python ringbearer.py login"
             )
+        # Resolve the assistant chat once, up front. Numeric ids depend on the
+        # session's entity cache and would otherwise fail on EVERY send —
+        # silently, from the ring's point of view. Better: refuse to start,
+        # with the fix named.
+        global assistant_entity
+        try:
+            assistant_entity = await asyncio.wait_for(
+                tg_client.get_input_entity(ASSISTANT_CHAT), timeout=30
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Can't resolve ASSISTANT_CHAT ({ASSISTANT_CHAT!r}): "
+                f"{type(e).__name__}: {e}\n"
+                "A numeric id only works for chats this account has already "
+                "seen from this session; the @username form always works — "
+                f"set it in {HERE / '.env'}."
+            ) from e
     async with mcp.session_manager.run():
         yield
     if tg_client is not None:
@@ -364,9 +420,21 @@ def login() -> None:
     print("(the leading + and country code are required — that's the +1 for the US —")
     print(" and no hyphens, spaces, or parentheses; a bare local number is rejected)\n")
     async def _login():
+        # Pre-create the session file owner-only: Telethon would otherwise
+        # create it at the umask default, leaving the account-bearing file
+        # world-readable for the whole interactive window below.
+        (HERE / f"{SESSION_NAME}.session").touch(mode=0o600, exist_ok=True)
         # Client construction and use stay inside one event loop — Telethon
-        # binds the client to the loop it was created under.
-        client = make_tg_client()
+        # binds the client to the loop it was created under. Construction
+        # also OPENS the session DB: a Pyrogram-era file fails here.
+        try:
+            client = make_tg_client()
+        except Exception as e:
+            sys.exit(
+                f"Can't open {SESSION_NAME}.session ({type(e).__name__}: {e}).\n"
+                "If it predates the Telethon migration (Pyrogram), delete it "
+                "and rerun: python ringbearer.py login"
+            )
         await client.start()  # interactive here is the point: phone, code, 2FA
         me = await client.get_me()
         await client.disconnect()
