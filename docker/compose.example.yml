@@ -1,0 +1,34 @@
+# Without an explicit name, the project would be named after this directory
+# ("docker") and collide with any other repo doing the same.
+name: ringbearer
+
+services:
+  ringbearer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    # The container always listens on 8787; to change the outside port,
+    # remap the HOST side of `ports:` below. Changing BIND_PORT instead
+    # would break the healthcheck, which probes 8787 inside the container.
+    environment:
+      BIND_HOST: 0.0.0.0
+      BIND_PORT: 8787
+    # Recommended: set RINGBEARER_HOST to this machine's Tailscale
+    # 100.x.x.x address. The default is reachable only from this host.
+    ports:
+      - "${RINGBEARER_HOST:-127.0.0.1}:8787:8787"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=2)
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s

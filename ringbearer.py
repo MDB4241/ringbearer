@@ -66,10 +66,21 @@ import logging
 logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("mcp").setLevel(logging.WARNING)
 
-load_dotenv()
-
 HERE = Path(__file__).parent
-CAPTURES = HERE / "captures.jsonl"
+# Private mutable state (.env, the Telegram session, captures.jsonl) lives in
+# RINGBEARER_STATE_DIR when set — the seam that keeps a Docker image
+# disposable while user data persists. Unset, it IS the checkout, and nothing
+# changes for native installs. Process environment only, never .env: this
+# value decides where .env is. Must be absolute — a relative path would move
+# with the launching directory, silently splitting state between cwds; empty
+# means unset, not cwd.
+_state_raw = os.environ.get("RINGBEARER_STATE_DIR", "").strip()
+if _state_raw and not Path(_state_raw).expanduser().is_absolute():
+    sys.exit(f"RINGBEARER_STATE_DIR must be an absolute path (got: {_state_raw!r})")
+STATE_DIR = (Path(_state_raw).expanduser() if _state_raw else HERE).resolve()
+load_dotenv(STATE_DIR / ".env")
+
+CAPTURES = STATE_DIR / "captures.jsonl"
 DRY_RUN_PREFIX = "DRYRUN:"
 
 # Terminal color helpers — plain when piped or NO_COLOR is set.
@@ -114,7 +125,7 @@ ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "assistant")
 RING_PREFIX = os.environ.get("RING_PREFIX", "\U0001f3a4 ")
 TG_API_ID = os.environ.get("TG_API_ID", "")
 if TG_API_ID and not TG_API_ID.isdigit():
-    sys.exit(f"TG_API_ID in .env is not a number — edit {HERE / '.env'}")
+    sys.exit(f"TG_API_ID in .env is not a number — edit {STATE_DIR / '.env'}")
 TG_API_HASH = os.environ.get("TG_API_HASH", "")
 SESSION_NAME = os.environ.get("SESSION_NAME", "ringbearer")
 # Telethon appends ".session" only when the name lacks it — a name already
@@ -122,12 +133,16 @@ SESSION_NAME = os.environ.get("SESSION_NAME", "ringbearer")
 # chmod (checks would look for name.session.session). Normalize once here.
 if SESSION_NAME.endswith(".session"):
     SESSION_NAME = SESSION_NAME[: -len(".session")]
+# A bare file name only: a separator or dot-dot would silently escape
+# STATE_DIR's containment promise (Path("/data") / "/tmp/x" IS /tmp/x).
+if "/" in SESSION_NAME or SESSION_NAME in ("", ".", ".."):
+    sys.exit(f"SESSION_NAME must be a bare file name, not a path (got: {SESSION_NAME!r})")
 MCP_MOUNT = os.environ.get("MCP_MOUNT", "/ringbearer")
 BIND_HOST = os.environ.get("BIND_HOST", "")
 try:
     BIND_PORT = int(os.environ.get("BIND_PORT", "8787"))
 except ValueError:
-    sys.exit(f"BIND_PORT in .env is not a number — edit {HERE / '.env'}")
+    sys.exit(f"BIND_PORT in .env is not a number — edit {STATE_DIR / '.env'}")
 
 # The tool name the ring app's LLM sees, e.g. send_to_hermes. Keep it free of
 # anything but [a-z0-9_]: the app sanitizes names for the LLM but dispatches on
@@ -146,7 +161,7 @@ def make_tg_client():
     # `ringbearer.py login` always share one file no matter which directory
     # launched the process (uvicorn, launchd, a shell — all the same).
     return TelegramClient(
-        str(HERE / SESSION_NAME),
+        str(STATE_DIR / SESSION_NAME),
         int(TG_API_ID),
         TG_API_HASH,
     )
@@ -285,7 +300,7 @@ async def lifespan(app: FastAPI):
                 "TELEGRAM_ENABLED but TG_API_ID/TG_API_HASH/ASSISTANT_CHAT missing "
                 "— run: python ringbearer.py setup"
             )
-        if not (HERE / f"{SESSION_NAME}.session").exists():
+        if not (STATE_DIR / f"{SESSION_NAME}.session").exists():
             raise RuntimeError(
                 f"TELEGRAM_ENABLED but no {SESSION_NAME}.session found "
                 "— run: python ringbearer.py login"
@@ -349,7 +364,7 @@ async def lifespan(app: FastAPI):
                 f"{type(e).__name__}: {e}\n"
                 "A numeric id only works for chats this account has already "
                 "seen from this session; the @username form always works — "
-                f"set it in {HERE / '.env'}."
+                f"set it in {STATE_DIR / '.env'}."
             ) from e
     async with mcp.session_manager.run():
         yield
@@ -423,7 +438,8 @@ def login() -> None:
         # Pre-create the session file owner-only: Telethon would otherwise
         # create it at the umask default, leaving the account-bearing file
         # world-readable for the whole interactive window below.
-        (HERE / f"{SESSION_NAME}.session").touch(mode=0o600, exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (STATE_DIR / f"{SESSION_NAME}.session").touch(mode=0o600, exist_ok=True)
         # Client construction and use stay inside one event loop — Telethon
         # binds the client to the loop it was created under. Construction
         # also OPENS the session DB: a Pyrogram-era file fails here.
@@ -445,7 +461,7 @@ def login() -> None:
     print(green(f"\nLogged in as {me.first_name} ({handle}) — session saved as {SESSION_NAME}.session"))
     # The session file IS the Telegram account — created at the umask default
     # (644); pull it to owner-only like .env and captures.jsonl.
-    for f in HERE.glob(f"{SESSION_NAME}.session*"):
+    for f in STATE_DIR.glob(f"{SESSION_NAME}.session*"):
         f.chmod(0o600)
 
 
@@ -453,7 +469,8 @@ def setup() -> None:
     """Interactive first-run walkthrough: collects every secret, writes .env."""
     import secrets
 
-    env_path = HERE / ".env"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    env_path = STATE_DIR / ".env"
     if env_path.exists():
         print(f"{env_path} already exists — edit it directly, or delete it and rerun setup.")
         missing = [
@@ -498,24 +515,33 @@ def setup() -> None:
     print("   (e.g. 'Hermes' -> send_to_hermes):")
     name = ask("     ASSISTANT_NAME [assistant]: ", default="assistant")
 
-    print("\n" + cyan("5. Where should the server listen?") + " Give the IP your phone can reach")
-    print("   this machine at:")
-    print("   - Tailscale IP (100.x.x.x) — recommended: works from anywhere, and")
-    print("     the port is never visible to your LAN or the internet.")
-    print("   - LAN IP (192.168.x.x) — works, but only while your phone is on the")
-    print("     same network, and anyone on that network can reach the port.")
-    print("   Never expose this to the public internet.")
-    while True:
-        host = ask("     BIND_HOST: ")
-        try:
-            _s = socket.socket()
-            _s.bind((host, 0))
-            _s.close()
-            break
-        except OSError:
-            print(dim("     (this machine can't bind that address — is Tailscale up?"))
-            print(dim("      `ifconfig` shows what's available)"))
-    port = ask("     BIND_PORT [8787]: ", default="8787", numeric=True)
+    # A container (or any wrapper) bakes BIND_HOST/BIND_PORT into the process
+    # environment, and the environment beats .env at runtime — asking here
+    # would collect an answer that could never take effect. Skip the question
+    # and say where the values came from.
+    if os.environ.get("BIND_HOST"):
+        host = os.environ["BIND_HOST"]
+        port = os.environ.get("BIND_PORT", "8787")
+        print("\n" + cyan("5. Listen address") + f" — already set by the environment: {host}:{port}")
+    else:
+        print("\n" + cyan("5. Where should the server listen?") + " Give the IP your phone can reach")
+        print("   this machine at:")
+        print("   - Tailscale IP (100.x.x.x) — recommended: works from anywhere, and")
+        print("     the port is never visible to your LAN or the internet.")
+        print("   - LAN IP (192.168.x.x) — works, but only while your phone is on the")
+        print("     same network, and anyone on that network can reach the port.")
+        print("   Never expose this to the public internet.")
+        while True:
+            host = ask("     BIND_HOST: ")
+            try:
+                _s = socket.socket()
+                _s.bind((host, 0))
+                _s.close()
+                break
+            except OSError:
+                print(dim("     (this machine can't bind that address — is Tailscale up?"))
+                print(dim("      `ifconfig` shows what's available)"))
+        port = ask("     BIND_PORT [8787]: ", default="8787", numeric=True)
 
     # Restricted from birth: no umask-default window with the token inside.
     env_path.touch(mode=0o600)
@@ -563,13 +589,19 @@ def check_bindable(host: str) -> None:
         sys.exit(
             f"Can't bind {host} ({e.strerror or e}) — this machine doesn't hold that\n"
             "address right now. Is Tailscale up? `ifconfig` lists what's available;\n"
-            f"fix BIND_HOST in {HERE / '.env'}."
+            f"fix BIND_HOST in {STATE_DIR / '.env'}."
         )
 
 
 def print_phone_settings(host: str, port: str, token: str) -> None:
     print(bold("\nPebble app settings") + " (Index settings → MCP servers)")
     print(dim("  — reprint any time with `python ringbearer.py setup`"))
+    if host == "0.0.0.0":
+        # The listener answers on every interface, but the phone needs a real
+        # address to dial — in Docker, the address the port is published on.
+        host = "<this-machine's-address>"
+        print(dim("  (0.0.0.0 is the listener, not a dialable address — in Docker, use"))
+        print(dim("   the host address you published the port on)"))
     print(f"  URL:     {yellow(f'http://{host}:{port}{MCP_MOUNT}/mcp')}   (transport: Streamable)")
     print(f"  Header:  {yellow(f'Authorization: Bearer {token}')}")
     print("  Name:    anything " + bold("WITHOUT spaces") + " (a space breaks tool dispatch)")
@@ -579,7 +611,7 @@ def print_phone_settings(host: str, port: str, token: str) -> None:
 def incomplete_env_exit(missing: list[str]) -> None:
     sys.exit(
         f".env is incomplete — missing: {', '.join(missing)}.\n"
-        f"Edit {HERE / '.env'} (see .env.example), or delete it and rerun "
+        f"Edit {STATE_DIR / '.env'} (see .env.example), or delete it and rerun "
         "`python ringbearer.py` to redo setup."
     )
 
@@ -590,7 +622,7 @@ def run() -> None:
     missing = required_missing()
     if missing:
         incomplete_env_exit(missing)
-    if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
+    if TELEGRAM_ENABLED and not (STATE_DIR / f"{SESSION_NAME}.session").exists():
         sys.exit(f"No {SESSION_NAME}.session — run: python ringbearer.py login")
     check_bindable(BIND_HOST)
     import uvicorn
@@ -653,6 +685,17 @@ def render_plist(label: str) -> str:
     if not python.exists():
         python = Path(sys.executable)
     logs = HERE / "logs"
+    # launchd does NOT inherit the installing shell's environment: without
+    # this block a custom RINGBEARER_STATE_DIR would silently revert to the
+    # checkout inside the agent — no .env found, KeepAlive crash loop.
+    env_block = ""
+    if STATE_DIR != HERE.resolve():
+        env_block = f"""    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RINGBEARER_STATE_DIR</key>
+        <string>{STATE_DIR}</string>
+    </dict>
+"""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -667,7 +710,7 @@ def render_plist(label: str) -> str:
     </array>
     <key>WorkingDirectory</key>
     <string>{HERE}</string>
-    <key>RunAtLoad</key>
+{env_block}    <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
@@ -706,15 +749,16 @@ def service(uninstall: bool = False) -> None:
         return
 
     for blocked in ("Documents", "Desktop", "Downloads"):
-        if Path.home() / blocked in HERE.parents:
-            sys.exit(
-                f"This checkout lives under ~/{blocked}, which launchd agents can't read\n"
-                "(macOS TCC). Move it somewhere like ~/Projects and rerun."
-            )
+        for d, what in ((HERE.resolve(), "checkout"), (STATE_DIR, "state directory")):
+            if Path.home() / blocked in d.parents:
+                sys.exit(
+                    f"The {what} lives under ~/{blocked}, which launchd agents can't read\n"
+                    "(macOS TCC). Move it somewhere like ~/Projects and rerun."
+                )
     missing = required_missing()
     if missing:
         incomplete_env_exit(missing)
-    if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
+    if TELEGRAM_ENABLED and not (STATE_DIR / f"{SESSION_NAME}.session").exists():
         sys.exit(f"No {SESSION_NAME}.session — run: python ringbearer.py login")
     check_bindable(BIND_HOST)
     s = socket.socket()
@@ -755,7 +799,7 @@ def service(uninstall: bool = False) -> None:
 def first_run(fresh: bool = False) -> None:
     """The whole onboarding as one loop: look at what exists on disk, collect
     what's missing, end with a running server. Safe to re-run forever."""
-    if not (HERE / ".env").exists():
+    if not (STATE_DIR / ".env").exists():
         if not sys.stdin.isatty():
             sys.exit(
                 "No .env yet, and no terminal to ask questions in — run "
@@ -772,7 +816,7 @@ def first_run(fresh: bool = False) -> None:
     if missing:
         incomplete_env_exit(missing)
     just_logged_in = False
-    if TELEGRAM_ENABLED and not (HERE / f"{SESSION_NAME}.session").exists():
+    if TELEGRAM_ENABLED and not (STATE_DIR / f"{SESSION_NAME}.session").exists():
         if not sys.stdin.isatty():
             sys.exit(f"No {SESSION_NAME}.session — run: python ringbearer.py login")
         print("One more thing: Telegram login.\n")
@@ -789,9 +833,16 @@ def first_run(fresh: bool = False) -> None:
         # to graduate it to a real service.
         print(bold("Starting the server in THIS terminal") + " so you can watch it work —")
         print("double-click your ring and the tool call will log below. Ctrl-C stops it.")
-        print("To run it permanently as a background service instead (macOS, one command):")
-        print("  " + bold("python ringbearer.py service"))
-        print(dim("(Details: README → Running it as a service.)\n"))
+        # The graduation advice depends on where this is running: `service` is
+        # launchd and only exists on a Mac — in a container or on Linux it
+        # would just be a dead end printed at the moment of success.
+        print("To run it permanently in the background instead:")
+        if sys.platform == "darwin":
+            print("  " + bold("python ringbearer.py service") + "   (macOS, one command)")
+        else:
+            print("  Docker: Ctrl-C, then " + bold("docker compose -f docker/compose.yml up -d"))
+            print("  Linux (native): run `ringbearer.py run` under systemd")
+        print(dim("(Details: README → Running it as a service / Docker.)\n"))
     run()
 
 
@@ -816,3 +867,9 @@ if __name__ == "__main__":
             print(__doc__)
     except (EOFError, KeyboardInterrupt):
         sys.exit("\nCancelled. Rerun `python ringbearer.py` when ready.")
+    except PermissionError as e:
+        sys.exit(
+            f"Permission denied: {e}\n"
+            f"Can this user write {STATE_DIR}? In Docker, see docker/README.md "
+            "→ Troubleshooting (bind-mount ownership)."
+        )

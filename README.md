@@ -83,7 +83,17 @@ Verify without touching your real DM:
 
 `probe` connects exactly like the phone would (same transport, same auth), so
 it bisects failures: probe succeeds → fix your phone settings; probe fails →
-fix server, network, or token. Set `BRIDGE_URL` to probe a remote install.
+fix server, network, or token. Set `BRIDGE_URL` to probe a remote install —
+and note the probe takes its token and tool name from the local config, so
+when the target runs different settings (a container, another machine), point
+`RINGBEARER_STATE_DIR` at that install's state directory too.
+
+## Docker
+
+Docker support keeps the image disposable and all private state in one
+bind-mounted directory. See [`docker/README.md`](docker/README.md) for the
+minimal image, Compose example, interactive Telegram login, and deliberate
+Tailscale/LAN binding.
 
 ## Phone settings (Pebble app)
 
@@ -160,7 +170,10 @@ if it lands, this gets even simpler.
 
 ## Configuration
 
-All via `.env` (see [`.env.example`](.env.example)):
+Configuration comes from the process environment and `.env` (see
+[`.env.example`](.env.example)). The process environment wins: a variable
+already set when the server starts (as the Docker image does for
+`BIND_HOST`/`BIND_PORT`) is not overridden by the same key in `.env`:
 
 | Variable | Meaning |
 |---|---|
@@ -173,6 +186,7 @@ All via `.env` (see [`.env.example`](.env.example)):
 | `SESSION_NAME` | Telegram session file name (default `ringbearer`) |
 | `RING_PREFIX` | Prefix on relayed messages (default 🎤) |
 | `MCP_MOUNT` | Mount path; endpoint is `<MCP_MOUNT>/mcp` (default `/ringbearer`) |
+| `RINGBEARER_STATE_DIR` | Absolute directory for `.env`, Telegram session files, and captures (process environment only; defaults to this checkout). `service` bakes it into the launchd plist. |
 
 ## License
 
