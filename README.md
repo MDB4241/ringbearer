@@ -83,17 +83,10 @@ Verify without touching your real DM:
 
 `probe` connects exactly like the phone would (same transport, same auth), so
 it bisects failures: probe succeeds → fix your phone settings; probe fails →
-fix server, network, or token. Set `BRIDGE_URL` to probe a remote install —
-and note the probe takes its token and tool name from the local config, so
-when the target runs different settings (a container, another machine), point
-`RINGBEARER_STATE_DIR` at that install's state directory too.
-
-## Docker
-
-Docker support keeps the image disposable and all private state in one
-bind-mounted directory. See [`docker/README.md`](docker/README.md) for the
-minimal image, Compose example, interactive Telegram login, and deliberate
-Tailscale/LAN binding.
+fix server, network, or token. Set `BRIDGE_URL` to probe a remote install.
+The probe builds its token and tool name from the local config — if the
+target runs different settings, point `RINGBEARER_STATE_DIR` at that
+install's state directory too.
 
 ## Phone settings (Pebble app)
 
@@ -125,6 +118,13 @@ by a foreground server.
 Hand-rollers and Linux users:
 [`ringbearer.plist.example`](ringbearer.plist.example) is the equivalent
 template, and `ringbearer.py run` under systemd works the same way.
+
+## Docker
+
+Docker support keeps the image disposable and all private state in one
+bind-mounted directory. See [`docker/README.md`](docker/README.md) for the
+minimal image, Compose example, interactive Telegram login, and deliberate
+Tailscale/LAN binding.
 
 ## Upgrading from a Pyrogram-era install
 
