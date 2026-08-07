@@ -2,5 +2,5 @@
 fastapi==0.141.1
 uvicorn==0.52.1
 python-dotenv==1.2.2
-pyrogram==2.0.106
+telethon==1.44.0
 mcp==2.0.0

@@ -16,7 +16,7 @@ Telegram like any other conversation. Start something from the ring on a walk,
 finish it on your phone later.
 
 Works with any assistant that lives in a Telegram chat: Hermes, OpenClaw, a
-bot you wrote yourself. One Python file — FastAPI, the MCP SDK, Pyrogram.
+bot you wrote yourself. One Python file — FastAPI, the MCP SDK, Telethon.
 
 ## How it works
 
@@ -33,7 +33,7 @@ sequenceDiagram
     Phone->>Cloud: transcript + tool list
     Cloud->>Phone: call send_to_*
     Phone->>RB: tools/call (Streamable HTTP, bearer token)
-    RB->>TG: post transcript as you (Pyrogram)
+    RB->>TG: post transcript as you (Telethon)
     TG->>TG: assistant replies in-thread
 ```
 
@@ -68,10 +68,11 @@ The pieces also exist standalone when you need one — `ringbearer.py setup`,
 (non-interactive by design, so a service manager can never hang on a prompt),
 and `ringbearer.py probe`.
 
-A note on Python versions: tested on 3.11 and 3.13. The Telegram layer, `pyrogram`
-2.0.106, is its author's final release and only declares support through
-3.11 — `ringbearer.py` carries a small event-loop guard that keeps it working on
-newer interpreters, but future breakage there is possible.
+A note on Python versions: tested on 3.11 and 3.13. The Telegram layer is
+[Telethon](https://docs.telethon.dev), pinned exact — its stable 1.x line has
+been continuously maintained for about a decade (development now lives on
+[Codeberg](https://codeberg.org/Lonami/Telethon); the archived GitHub repo is
+a move, not an ending).
 
 Verify without touching your real DM:
 
@@ -114,6 +115,14 @@ by a foreground server.
 Hand-rollers and Linux users:
 [`ringbearer.plist.example`](ringbearer.plist.example) is the equivalent
 template, and `ringbearer.py run` under systemd works the same way.
+
+## Upgrading from a Pyrogram-era install
+
+Releases before the Telethon migration used Pyrogram for the Telegram layer;
+the two session formats are incompatible. After pulling: reinstall
+dependencies (`.venv/bin/pip install -r requirements.txt`), delete the old
+`ringbearer.session`, and run `python ringbearer.py login` once. Everything
+else — `.env`, phone settings, endpoints — carries over untouched.
 
 ## Security notes
 
@@ -159,7 +168,7 @@ All via `.env` (see [`.env.example`](.env.example)):
 | `ASSISTANT_NAME` | Display name; becomes the tool name (`Hermes` → `send_to_hermes`) |
 | `TG_API_ID` / `TG_API_HASH` | Telegram API credentials (my.telegram.org) |
 | `BIND_HOST` / `BIND_PORT` | Listen address — the IP your phone can reach (default port `8787`) |
-| `SESSION_NAME` | Pyrogram session file name (default `ringbearer`) |
+| `SESSION_NAME` | Telegram session file name (default `ringbearer`) |
 | `RING_PREFIX` | Prefix on relayed messages (default 🎤) |
 | `MCP_MOUNT` | Mount path; endpoint is `<MCP_MOUNT>/mcp` (default `/ringbearer`) |
 

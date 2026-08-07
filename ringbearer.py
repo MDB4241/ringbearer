@@ -41,15 +41,7 @@ import sys
 if sys.version_info < (3, 10):
     sys.exit(f"ringbearer needs Python 3.10+ (you have {sys.version.split()[0]}).")
 
-# Python 3.14+: Pyrogram's sync module calls asyncio.get_event_loop() at import
-# time, which raises if no loop is set yet. Ensure one exists before importing.
 import asyncio
-
-try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
 import hmac
 import json
 import os
@@ -66,12 +58,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from mcp.server import MCPServer
 
-# Keep the room quiet: Pyrogram narrates every connection ("NetworkTask
-# started", "14 HandlerTasks") and the MCP SDK logs "Terminating session"
-# per stateless request — noise that buries the output that matters.
+# Keep the room quiet: Telethon narrates connections and updates, and the MCP
+# SDK logs "Terminating session" per stateless request — noise that buries the
+# output that matters.
 import logging
 
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
+logging.getLogger("telethon").setLevel(logging.WARNING)
 logging.getLogger("mcp").setLevel(logging.WARNING)
 
 load_dotenv()
@@ -109,8 +101,10 @@ def cyan(s: str) -> str:
 
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
 TELEGRAM_ENABLED = os.environ.get("TELEGRAM_ENABLED", "false").lower() == "true"
-# @username, or a bare numeric chat id. Pyrogram resolves a digits-only STRING
-# as a phone number, so numeric ids must be coerced to int to work at all.
+# @username, or a bare numeric chat id. A digits-only STRING gets resolved as
+# a phone number, so numeric ids must be coerced to int — and Telethon resolves
+# a bare int only for chats this account has already seen (any DM actually in
+# use qualifies; its entity is in the session cache). @username always works.
 _chat = os.environ.get("ASSISTANT_CHAT", "")
 ASSISTANT_CHAT = int(_chat) if re.fullmatch(r"-?\d+", _chat) else _chat
 ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "assistant")
@@ -137,16 +131,15 @@ tg_client = None
 
 
 def make_tg_client():
-    from pyrogram import Client
+    from telethon import TelegramClient
 
-    # workdir is pinned to this file's directory: Pyrogram otherwise anchors the
-    # session to Path(sys.argv[0]).parent, which is .venv/bin under uvicorn — the
-    # session written by `ringbearer.py login` would be invisible to the server.
-    return Client(
-        SESSION_NAME,
-        api_id=int(TG_API_ID),
-        api_hash=TG_API_HASH,
-        workdir=str(HERE),
+    # The session path is explicit and absolute, so the server and
+    # `ringbearer.py login` always share one file no matter which directory
+    # launched the process (uvicorn, launchd, a shell — all the same).
+    return TelegramClient(
+        str(HERE / SESSION_NAME),
+        int(TG_API_ID),
+        TG_API_HASH,
     )
 
 
@@ -199,7 +192,7 @@ async def send_to_assistant(message: str) -> str:
     started = time.monotonic()
     err = None
     try:
-        # Bounded: a Pyrogram stall must not hold the transcript hostage —
+        # Bounded: a Telegram stall must not hold the transcript hostage —
         # timeout lands in the except and the capture row still gets written.
         sent = await asyncio.wait_for(deliver(message), timeout=30)
     except Exception as e:  # the transcript is the only copy — log it no matter what
@@ -283,20 +276,29 @@ async def lifespan(app: FastAPI):
                 "— run: python ringbearer.py login"
             )
         tg_client = make_tg_client()
+        # connect(), never start(): start() would prompt for a phone number on
+        # an unauthorized session, and this path must stay launchd-safe. A bad
+        # session fails fast with the fix named instead of a crash-loop
+        # traceback (or worse, a silent hang on a prompt no one will answer).
         try:
-            await tg_client.start()
+            await tg_client.connect()
+            authorized = await tg_client.is_user_authorized()
         except Exception as e:
-            # A revoked/terminated session (AUTH_KEY_UNREGISTERED) otherwise
-            # surfaces as a bare traceback in a launchd crash loop.
             raise RuntimeError(
-                f"Telegram client failed to start ({type(e).__name__}: {e}).\n"
-                f"If this session was revoked or terminated, delete "
-                f"{SESSION_NAME}.session and run: python ringbearer.py login"
+                f"Telegram client failed to connect ({type(e).__name__}: {e}).\n"
+                f"If {SESSION_NAME}.session predates the Telethon migration or "
+                f"was revoked, delete it and run: python ringbearer.py login"
             ) from e
+        if not authorized:
+            raise RuntimeError(
+                f"{SESSION_NAME}.session exists but is not authorized (revoked, "
+                "terminated, or written by a different library) — delete it "
+                "and run: python ringbearer.py login"
+            )
     async with mcp.session_manager.run():
         yield
     if tg_client is not None:
-        await tg_client.stop()
+        await tg_client.disconnect()
 
 
 # Docs/OpenAPI off: nothing here is browsable, and the README's "everything
@@ -342,11 +344,11 @@ async def healthz():
 
 
 def login() -> None:
-    """One-time interactive Pyrogram login; creates the session file."""
+    """One-time interactive Telegram login; creates the session file."""
     if not (TG_API_ID and TG_API_HASH):
         sys.exit("Set TG_API_ID and TG_API_HASH in .env first (python ringbearer.py setup)")
-    # Refuse while the server is up: two Pyrogram clients on one session file
-    # can trigger AUTH_KEY_DUPLICATED and get the Telegram session revoked.
+    # Refuse while the server is up: two clients on one session file can
+    # trigger AUTH_KEY_DUPLICATED and get the Telegram session revoked.
     s = socket.socket()
     s.settimeout(0.5)
     server_up = s.connect_ex((BIND_HOST or "127.0.0.1", BIND_PORT)) == 0
@@ -361,14 +363,20 @@ def login() -> None:
     print("Phone number format: " + bold("+<country code><number>, digits only") + " — e.g. +12025550143")
     print("(the leading + and country code are required — that's the +1 for the US —")
     print(" and no hyphens, spaces, or parentheses; a bare local number is rejected)\n")
-    client = make_tg_client()
-    client.start()
-    me = client.get_me()
+    async def _login():
+        # Client construction and use stay inside one event loop — Telethon
+        # binds the client to the loop it was created under.
+        client = make_tg_client()
+        await client.start()  # interactive here is the point: phone, code, 2FA
+        me = await client.get_me()
+        await client.disconnect()
+        return me
+
+    me = asyncio.run(_login())
     handle = f"@{me.username}" if me.username else "no public username"
     print(green(f"\nLogged in as {me.first_name} ({handle}) — session saved as {SESSION_NAME}.session"))
-    client.stop()
-    # The session file IS the Telegram account — Pyrogram creates it at the
-    # umask default (644); pull it to owner-only like .env and captures.jsonl.
+    # The session file IS the Telegram account — created at the umask default
+    # (644); pull it to owner-only like .env and captures.jsonl.
     for f in HERE.glob(f"{SESSION_NAME}.session*"):
         f.chmod(0o600)
 
