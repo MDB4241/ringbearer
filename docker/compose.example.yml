@@ -1,0 +1,27 @@
+services:
+  ringbearer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    environment:
+      BIND_HOST: 0.0.0.0
+      BIND_PORT: 8787
+    # Recommended: set RINGBEARER_HOST to this machine's Tailscale
+    # 100.x.x.x address. The default is reachable only from this host.
+    ports:
+      - "${RINGBEARER_HOST:-127.0.0.1}:8787:8787"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8787/healthz', timeout=2)
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
