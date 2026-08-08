@@ -112,6 +112,9 @@ def cyan(s: str) -> str:
 
 BRIDGE_TOKEN = os.environ.get("BRIDGE_TOKEN", "")
 TELEGRAM_ENABLED = os.environ.get("TELEGRAM_ENABLED", "false").lower() == "true"
+NEW_TOPIC_PER_CAPTURE = (
+    os.environ.get("NEW_TOPIC_PER_CAPTURE", "false").lower() == "true"
+)
 # @username, or a bare numeric chat id. A digits-only STRING gets resolved as
 # a phone number, so numeric ids are coerced to int. Numeric ids are best-
 # effort in Telethon — they resolve only from the session file's own entity
@@ -173,18 +176,54 @@ def log_capture(row: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def topic_title(message: str) -> str:
+    normalized = " ".join(message.split())
+    return normalized[:80] or "Ring capture"
+
+
+def delivery_mode_label() -> str:
+    if NEW_TOPIC_PER_CAPTURE:
+        return "new topic per capture"
+    return "current Telegram conversation"
+
+
+def created_topic_root_id(result) -> int | None:
+    from telethon.tl.types import MessageActionTopicCreate
+
+    for update in getattr(result, "updates", ()):
+        message = getattr(update, "message", None)
+        if isinstance(getattr(message, "action", None), MessageActionTopicCreate):
+            return getattr(message, "id", None)
+    return None
+
+
 async def deliver(message: str) -> bool:
     """Post into the assistant DM as the user. Returns True if actually sent."""
-    if TELEGRAM_ENABLED and tg_client is not None:
-        # parse_mode=None: the transcript is a promise ("verbatim and in
-        # full"), so *, _, ` and [] must arrive as characters, not formatting.
-        await tg_client.send_message(
-            assistant_entity if assistant_entity is not None else ASSISTANT_CHAT,
-            f"{RING_PREFIX}{message}",
-            parse_mode=None,
+    if not TELEGRAM_ENABLED or tg_client is None:
+        return False
+
+    entity = assistant_entity if assistant_entity is not None else ASSISTANT_CHAT
+    send_kwargs = {}
+    if NEW_TOPIC_PER_CAPTURE:
+        from telethon.tl.functions.messages import CreateForumTopicRequest
+
+        result = await tg_client(
+            CreateForumTopicRequest(peer=entity, title=topic_title(message))
         )
-        return True
-    return False
+        topic_root_id = created_topic_root_id(result)
+        if topic_root_id is None:
+            raise RuntimeError("Telegram topic creation returned no topic root message")
+        send_kwargs["reply_to"] = topic_root_id
+
+    # parse_mode=None: the transcript is a promise ("verbatim and in
+    # full"), so *, _, ` and [] must arrive as characters, not formatting.
+    await tg_client.send_message(
+        entity,
+        f"{RING_PREFIX}{message}",
+        parse_mode=None,
+        **send_kwargs,
+    )
+    return True
 
 
 # --- MCP server ---------------------------------------------------------------
@@ -548,6 +587,7 @@ def setup() -> None:
     env_path.write_text(
         f"BRIDGE_TOKEN={token}\n"
         "TELEGRAM_ENABLED=true\n"
+        "NEW_TOPIC_PER_CAPTURE=false\n"
         f"ASSISTANT_CHAT={chat}\n"
         f"ASSISTANT_NAME={name}\n"
         f"TG_API_ID={api_id}\n"
@@ -604,6 +644,7 @@ def print_phone_settings(host: str, port: str, token: str) -> None:
         print(dim("   the host address you published the port on)"))
     print(f"  URL:     {yellow(f'http://{host}:{port}{MCP_MOUNT}/mcp')}   (transport: Streamable)")
     print(f"  Header:  {yellow(f'Authorization: Bearer {token}')}")
+    print(f"  Delivery: {delivery_mode_label()}")
     print("  Name:    anything " + bold("WITHOUT spaces") + " (a space breaks tool dispatch)")
     print("  Group:   model type Default, then Secondary Mode → MCP Sandbox → pick the group.")
 
@@ -628,6 +669,7 @@ def run() -> None:
     import uvicorn
 
     print(bold(f"ringbearer → http://{BIND_HOST}:{BIND_PORT}{MCP_MOUNT}/mcp"))
+    print(f"Telegram delivery: {delivery_mode_label()}")
     if not TELEGRAM_ENABLED:
         print(
             yellow(

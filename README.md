@@ -10,13 +10,19 @@ assistant, using its Telegram DM as the conversation surface.
 Double-click-hold the ring and speak. The Pebble app transcribes, its MCP
 sandbox agent calls this bridge's one tool, and the bridge posts your words
 into your existing Telegram DM with the assistant — **as you, from your own
-Telegram account**. The assistant sees a normal message in a thread it already
-knows, replies with full context, and the whole exchange stays auditable in
-Telegram like any other conversation. Start something from the ring on a walk,
-finish it on your phone later.
+Telegram account**. By default, the assistant sees a normal message in a
+thread it already knows and replies with full context. Optional per-capture
+topics start a fresh context instead. Either way, the whole exchange stays
+auditable in Telegram like any other conversation. Start something from the
+ring on a walk, finish it on your phone later.
 
 Works with any assistant that lives in a Telegram chat: Hermes, OpenClaw, a
 bot you wrote yourself. One Python file — FastAPI, the MCP SDK, Telethon.
+
+By default, captures continue in the current Telegram conversation. Set
+`NEW_TOPIC_PER_CAPTURE=true` to create a fresh topic for every capture instead.
+This optional mode is useful for assistants such as Hermes that keep separate
+context per Telegram topic.
 
 ## How it works
 
@@ -152,6 +158,10 @@ before you've done this, it refuses with exactly this fix named.
 - **The session file is your Telegram account.** `*.session` is gitignored;
   treat it like a password. One process per session file — a second client on
   the same session risks `AUTH_KEY_DUPLICATED` and revocation.
+- **New-topic mode has Telegram prerequisites.** The assistant bot must have
+  private-chat topics enabled and allow users to create topics. Telegram may
+  also require the sending user to have Premium. Topic creation fails closed:
+  ringbearer logs the capture instead of silently sending it to another topic.
 - **Probes are dry-run by default.** A live probe is a real message your real
   assistant will act on; `--live` is a deliberate flag for that reason.
 - **Captures are also logged locally.** Every transcript is appended verbatim
@@ -179,6 +189,7 @@ already set when the server starts (as the Docker image does for
 |---|---|
 | `BRIDGE_TOKEN` | Bearer token the phone must send (setup generates one) |
 | `TELEGRAM_ENABLED` | `true` to actually deliver; `false` = log-only mode |
+| `NEW_TOPIC_PER_CAPTURE` | `true` creates a fresh Telegram topic for every capture (default `false`) |
 | `ASSISTANT_CHAT` | `@botusername` of the assistant DM (recommended; a numeric chat id works only for chats this account's session has already seen — the server verifies at startup) |
 | `ASSISTANT_NAME` | Display name; becomes the tool name (`Hermes` → `send_to_hermes`) |
 | `TG_API_ID` / `TG_API_HASH` | Telegram API credentials (my.telegram.org) |
