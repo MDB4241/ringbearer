@@ -94,6 +94,10 @@ The probe builds its token and tool name from the local config — if the
 target runs different settings, point `RINGBEARER_STATE_DIR` at that
 install's state directory too.
 
+There is also an offline test suite covering delivery routing, including the
+fail-closed topic path — `.venv/bin/python -m unittest` — no network, no
+Telegram account involved.
+
 ## Phone settings (Pebble app)
 
 Under Index settings → MCP servers:
@@ -158,10 +162,12 @@ before you've done this, it refuses with exactly this fix named.
 - **The session file is your Telegram account.** `*.session` is gitignored;
   treat it like a password. One process per session file — a second client on
   the same session risks `AUTH_KEY_DUPLICATED` and revocation.
-- **New-topic mode has Telegram prerequisites.** The assistant bot must have
-  private-chat topics enabled and allow users to create topics. Telegram may
-  also require the sending user to have Premium. Topic creation fails closed:
-  ringbearer logs the capture instead of silently sending it to another topic.
+- **New-topic mode has Telegram prerequisites.** In [@BotFather](https://t.me/BotFather),
+  enable **Threaded Mode** on your assistant's bot (Bot Settings → Threads
+  Settings) and keep "users can create topics" allowed, then activate Topics
+  in the DM chat itself — private-chat topics are a Bot API 9.4 feature and
+  are off by default. Topic creation fails closed: ringbearer logs the
+  capture instead of silently sending it to another topic.
 - **Probes are dry-run by default.** A live probe is a real message your real
   assistant will act on; `--live` is a deliberate flag for that reason.
 - **Captures are also logged locally.** Every transcript is appended verbatim

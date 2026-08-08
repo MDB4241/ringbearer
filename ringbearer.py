@@ -163,6 +163,9 @@ def make_tg_client():
     # The session path is explicit and absolute, so the server and
     # `ringbearer.py login` always share one file no matter which directory
     # launched the process (uvicorn, launchd, a shell — all the same).
+    # No flood_sleep_threshold override here: this factory also serves
+    # login/setup, where Telethon's default sleeping is the right behavior.
+    # The serving-phase policy is set in lifespan, after the startup probes.
     return TelegramClient(
         str(STATE_DIR / SESSION_NAME),
         int(TG_API_ID),
@@ -187,41 +190,68 @@ def delivery_mode_label() -> str:
     return "current Telegram conversation"
 
 
-def created_topic_root_id(result) -> int | None:
-    from telethon.tl.types import MessageActionTopicCreate
+async def create_topic(title: str) -> int:
+    """Create a fresh topic in the assistant chat and return its topic id.
 
-    for update in getattr(result, "updates", ()):
-        message = getattr(update, "message", None)
-        if isinstance(getattr(message, "action", None), MessageActionTopicCreate):
-            return getattr(message, "id", None)
-    return None
+    Telethon has no high-level helper for this, so it goes through the raw
+    API. `messages.CreateForumTopicRequest` takes a generic peer (that is
+    what makes topics in a bot DM possible at all) and returns a raw
+    `Updates` — the new topic's id is the id of the topic-created service
+    message inside it. No id found means the topic did not verifiably exist,
+    and delivering anyway would land the capture in whatever thread Telegram
+    picks — so that raises instead.
+    """
+    from telethon.tl.functions.messages import CreateForumTopicRequest
+    from telethon.tl.types import MessageActionTopicCreate, UpdateMessageID
+
+    request = CreateForumTopicRequest(
+        peer=assistant_entity if assistant_entity is not None else ASSISTANT_CHAT,
+        title=title,
+    )
+    result = await tg_client(request)
+    # The result is an Updates union: usually a container with .updates, but
+    # UpdateShort carries a single .update — normalize both shapes.
+    updates = getattr(result, "updates", None)
+    if updates is None and hasattr(result, "update"):
+        updates = [result.update]
+    # Two sources for the new topic's id: the UpdateMessageID whose random_id
+    # echoes this request (authoritative — the same mapping Telethon's own
+    # response parser uses), and the topic-created service message (present
+    # in the usual shape). Prefer the correlated one.
+    scanned = None
+    for update in updates or []:
+        if (
+            isinstance(update, UpdateMessageID)
+            and update.random_id == request.random_id
+        ):
+            return update.id
+        msg = getattr(update, "message", None)
+        if isinstance(getattr(msg, "action", None), MessageActionTopicCreate):
+            scanned = msg.id
+    if scanned is None:
+        raise RuntimeError("Telegram topic creation returned no thread identifier")
+    return scanned
 
 
 async def deliver(message: str) -> bool:
     """Post into the assistant DM as the user. Returns True if actually sent."""
-    if not TELEGRAM_ENABLED or tg_client is None:
+    if not (TELEGRAM_ENABLED and tg_client is not None):
         return False
-
-    entity = assistant_entity if assistant_entity is not None else ASSISTANT_CHAT
-    send_kwargs = {}
-    if NEW_TOPIC_PER_CAPTURE:
-        from telethon.tl.functions.messages import CreateForumTopicRequest
-
-        result = await tg_client(
-            CreateForumTopicRequest(peer=entity, title=topic_title(message))
-        )
-        topic_root_id = created_topic_root_id(result)
-        if topic_root_id is None:
-            raise RuntimeError("Telegram topic creation returned no topic root message")
-        send_kwargs["reply_to"] = topic_root_id
-
+    # Topic mode fails closed: if creation raises, nothing is sent — a
+    # capture must never silently land in a thread the user didn't pick.
+    # (The capture is still written to captures.jsonl by the caller.)
+    reply_to = (
+        await create_topic(topic_title(message)) if NEW_TOPIC_PER_CAPTURE else None
+    )
     # parse_mode=None: the transcript is a promise ("verbatim and in
     # full"), so *, _, ` and [] must arrive as characters, not formatting.
+    # reply_to targets the topic's root service message, which threads the
+    # send into that topic; None is Telethon's default (no threading).
     await tg_client.send_message(
-        entity,
+        assistant_entity if assistant_entity is not None else ASSISTANT_CHAT,
         f"{RING_PREFIX}{message}",
         parse_mode=None,
-        **send_kwargs,
+        reply_to=reply_to,
     )
     return True
 
@@ -259,25 +289,35 @@ async def send_to_assistant(message: str) -> str:
         return "Dry run: received, not delivered to Telegram."
 
     started = time.monotonic()
+
+    def finish(sent: bool, err: str | None) -> None:
+        send_ms = round((time.monotonic() - started) * 1000)
+        print(f"[mcp] {TOOL_NAME}: telegram {send_ms}ms" + (f" ERROR {err}" if err else ""), flush=True)
+        row = {
+            "received_at": datetime.now().astimezone().isoformat(),
+            "source": "mcp",
+            "transcription": message,
+            "forwarded": sent,
+            "telegram_ms": send_ms,
+        }
+        if err:
+            row["error"] = err
+        log_capture(row)
+
     err = None
     try:
         # Bounded: a Telegram stall must not hold the transcript hostage —
         # timeout lands in the except and the capture row still gets written.
         sent = await asyncio.wait_for(deliver(message), timeout=30)
+    except asyncio.CancelledError as e:
+        # Cancellation (request dropped, server shutting down) is
+        # BaseException, so the clause below never sees it — log the only
+        # copy of the transcript first, then propagate it bare.
+        finish(False, repr(e))
+        raise
     except Exception as e:  # the transcript is the only copy — log it no matter what
         sent, err = False, repr(e)
-    send_ms = round((time.monotonic() - started) * 1000)
-    print(f"[mcp] {TOOL_NAME}: telegram {send_ms}ms" + (f" ERROR {err}" if err else ""), flush=True)
-    row = {
-        "received_at": datetime.now().astimezone().isoformat(),
-        "source": "mcp",
-        "transcription": message,
-        "forwarded": sent,
-        "telegram_ms": send_ms,
-    }
-    if err:
-        row["error"] = err
-    log_capture(row)
+    finish(sent, err)
     if sent:
         return f"Delivered. {ASSISTANT_NAME} will reply in Telegram."
     if err:
@@ -365,9 +405,15 @@ async def lifespan(app: FastAPI):
         # lifespan pending forever with /healthz never binding.
         try:
             await asyncio.wait_for(tg_client.connect(), timeout=30)
-            authorized = await asyncio.wait_for(
-                tg_client.is_user_authorized(), timeout=30
-            )
+            # get_me(), never is_user_authorized(): the latter swallows EVERY
+            # RPC error into False — a flood wait would read as "revoked" and
+            # the advice below would tell the user to delete a healthy session
+            # (while a service manager restart-loops it). get_me() returns
+            # None only for a genuinely unauthorized session and lets
+            # FloodWaitError reach the handler below.
+            authorized = (
+                await asyncio.wait_for(tg_client.get_me(), timeout=30)
+            ) is not None
         except FloodWaitError as e:
             # Rate limiting is NOT a broken session — advising deletion here
             # would destroy a healthy login during a restart storm.
@@ -405,6 +451,12 @@ async def lifespan(app: FastAPI):
                 "seen from this session; the @username form always works — "
                 f"set it in {STATE_DIR / '.env'}."
             ) from e
+        # Serving-phase flood policy, set only after the probes above: sleep
+        # through short waits, but surface longer ones as FloodWaitError —
+        # under Telethon's 60s default, deliver()'s 30s deadline would kill
+        # the sleep mid-nap and log a generic timeout instead of the real
+        # error. login/setup keep the default via the untouched factory.
+        tg_client.flood_sleep_threshold = 25
     async with mcp.session_manager.run():
         yield
     if tg_client is not None:

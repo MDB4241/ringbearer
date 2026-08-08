@@ -1,18 +1,27 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from telethon.tl.functions.messages import CreateForumTopicRequest
-from telethon.tl.types import MessageActionTopicCreate
+from telethon.tl.types import MessageActionTopicCreate, UpdateMessageID
 
 import ringbearer
 
 
 class FakeTelegramClient:
-    def __init__(self, *, topic_id=42, create_error=None, send_error=None):
+    def __init__(
+        self,
+        *,
+        topic_id=42,
+        create_error=None,
+        send_error=None,
+        raw_response_factory=None,
+    ):
         self.topic_id = topic_id
         self.create_error = create_error
         self.send_error = send_error
+        self.raw_response_factory = raw_response_factory
         self.requests = []
         self.sent = []
 
@@ -20,6 +29,8 @@ class FakeTelegramClient:
         self.requests.append(request)
         if self.create_error:
             raise self.create_error
+        if self.raw_response_factory is not None:
+            return self.raw_response_factory(request)
         message = SimpleNamespace(
             id=self.topic_id,
             action=MessageActionTopicCreate(title=request.title, icon_color=0x6FB9F0),
@@ -84,7 +95,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.requests, [])
         self.assertEqual(
             client.sent,
-            [(entity, "mic: hello", {"parse_mode": None})],
+            [(entity, "mic: hello", {"parse_mode": None, "reply_to": None})],
         )
 
     async def test_topic_delivery_creates_then_replies_to_topic_root(self):
@@ -132,7 +143,7 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             tg_client=client,
             assistant_entity=object(),
         ):
-            with self.assertRaisesRegex(RuntimeError, "topic root"):
+            with self.assertRaisesRegex(RuntimeError, "thread identifier"):
                 await ringbearer.deliver("hello")
         self.assertEqual(client.sent, [])
 
@@ -147,6 +158,70 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "send failed"):
                 await ringbearer.deliver("hello")
+
+    async def test_topic_id_extracted_from_updateshort(self):
+        # UpdateShort carries a single .update instead of an .updates list —
+        # a successfully created topic in that shape must not read as missing.
+        short = SimpleNamespace(
+            update=SimpleNamespace(
+                message=SimpleNamespace(
+                    id=7,
+                    action=MessageActionTopicCreate(title="t", icon_color=0),
+                )
+            )
+        )
+        client = FakeTelegramClient(raw_response_factory=lambda req: short)
+        with patch.multiple(
+            ringbearer, tg_client=client, assistant_entity=object()
+        ):
+            self.assertEqual(await ringbearer.create_topic("a title"), 7)
+
+    async def test_topic_id_prefers_correlated_update_message_id(self):
+        # The UpdateMessageID whose random_id echoes our request is the
+        # authoritative mapping (the same one Telethon's parser uses) — it
+        # must work even when no service message appears at all.
+        client = FakeTelegramClient(
+            raw_response_factory=lambda req: SimpleNamespace(
+                updates=[UpdateMessageID(id=321, random_id=req.random_id)]
+            )
+        )
+        with patch.multiple(
+            ringbearer, tg_client=client, assistant_entity=object()
+        ):
+            self.assertEqual(await ringbearer.create_topic("a title"), 321)
+
+
+class DurableLoggingTests(unittest.IsolatedAsyncioTestCase):
+    """The capture row is the only copy of the transcript — it must be
+    written no matter how delivery dies."""
+
+    async def test_cancellation_still_logs_capture(self):
+        rows = []
+        deliver = AsyncMock(side_effect=asyncio.CancelledError)
+        with (
+            patch.object(ringbearer, "deliver", deliver),
+            patch.object(ringbearer, "log_capture", rows.append),
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await ringbearer.send_to_assistant("hello")
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["forwarded"])
+        self.assertIn("CancelledError", rows[0]["error"])
+
+    async def test_delivery_error_still_logs_capture(self):
+        rows = []
+        deliver = AsyncMock(side_effect=RuntimeError("boom"))
+        with (
+            patch.object(ringbearer, "deliver", deliver),
+            patch.object(ringbearer, "log_capture", rows.append),
+            patch("builtins.print"),
+        ):
+            result = await ringbearer.send_to_assistant("hello")
+        self.assertIn("delivery failed", result)
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["forwarded"])
+        self.assertIn("boom", rows[0]["error"])
 
 
 if __name__ == "__main__":
