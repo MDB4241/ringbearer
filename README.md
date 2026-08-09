@@ -19,10 +19,11 @@ ring on a walk, finish it on your phone later.
 Works with any assistant that lives in a Telegram chat: Hermes, OpenClaw, a
 bot you wrote yourself. One Python file — FastAPI, the MCP SDK, Telethon.
 
-By default, captures continue in the current Telegram conversation. Set
-`NEW_TOPIC_PER_CAPTURE=true` to create a fresh topic for every capture instead.
-This optional mode is useful for assistants such as Hermes that keep separate
-context per Telegram topic.
+Set `NEW_TOPIC_PER_CAPTURE=true` to create a fresh topic for every capture
+instead — useful for assistants such as Hermes that keep separate context per
+Telegram topic. The tradeoff: each capture starts a clean conversation, so
+the ring only ever opens threads. Follow-ups happen from your phone, inside
+the topic the assistant replied in.
 
 ## How it works
 
@@ -164,10 +165,12 @@ before you've done this, it refuses with exactly this fix named.
   the same session risks `AUTH_KEY_DUPLICATED` and revocation.
 - **New-topic mode has Telegram prerequisites.** In [@BotFather](https://t.me/BotFather),
   enable **Threaded Mode** on your assistant's bot (Bot Settings → Threads
-  Settings) and keep "users can create topics" allowed, then activate Topics
-  in the DM chat itself — private-chat topics are a Bot API 9.4 feature and
-  are off by default. Topic creation fails closed: ringbearer logs the
-  capture instead of silently sending it to another topic.
+  Settings) and keep "users can create topics" allowed. Then in the DM chat
+  itself, tap the bot's name and flip the **Topics** toggle — it only appears
+  after the BotFather change (restart Telegram if you don't see it).
+  Private-chat topics are a Bot API 9.4 feature, off by default. Topic
+  creation fails closed: ringbearer logs the capture instead of silently
+  sending it to another topic.
 - **Probes are dry-run by default.** A live probe is a real message your real
   assistant will act on; `--live` is a deliberate flag for that reason.
 - **Captures are also logged locally.** Every transcript is appended verbatim
