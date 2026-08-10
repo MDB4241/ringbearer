@@ -147,6 +147,37 @@ run `.venv/bin/python ringbearer.py login` once. Everything else — `.env`,
 phone settings, endpoints — carries over untouched. If the server starts
 before you've done this, it refuses with exactly this fix named.
 
+## Multiple assistants
+
+One bridge can carry to more than one assistant. Map the extras in `.env`:
+
+```
+ASSISTANTS=plutus:@plutus_bot,quartermaster:@qm_bot
+```
+
+Each entry is `name:chat` — the name a short lowercase token, the chat the
+same forms as `ASSISTANT_CHAT`. With any mapping present, the tool grows an
+optional `assistant` argument whose schema lists every valid name (the
+default assistant included), so the app's agent learns the roster the moment
+it connects — nothing to configure on the phone, ever. Say "ask plutus to
+check my portfolio" and the capture routes to that chat; say nothing and it
+goes to the default.
+
+An unknown name is refused with the valid list, and the capture still lands
+in `captures.jsonl` — words are never silently re-routed to a chat you
+didn't address. Every mapped chat is verified at startup, and topic mode
+applies to all of them: with `NEW_TOPIC_PER_CAPTURE=true`, enable Threaded
+Mode on each bot.
+
+Test a mapping without the ring:
+
+```bash
+.venv/bin/python ringbearer.py probe --assistant plutus
+```
+
+Without `ASSISTANTS` set, none of this exists — the tool keeps its single
+`message` argument.
+
 ## Security notes
 
 - **Your words pass through Pebble's cloud.** The phone transcribes on device,
@@ -201,6 +232,7 @@ already set when the server starts (as the Docker image does for
 | `NEW_TOPIC_PER_CAPTURE` | `true` creates a fresh Telegram topic for every capture (default `false`) |
 | `ASSISTANT_CHAT` | `@botusername` of the assistant DM (recommended; a numeric chat id works only for chats this account's session has already seen — the server verifies at startup) |
 | `ASSISTANT_NAME` | Display name; becomes the tool name (`Hermes` → `send_to_hermes`) |
+| `ASSISTANTS` | Optional extra assistants, `name:chat` pairs (`plutus:@plutus_bot,qm:@qm_bot`) — adds an `assistant` argument to the tool; see [Multiple assistants](#multiple-assistants) |
 | `TG_API_ID` / `TG_API_HASH` | Telegram API credentials (my.telegram.org) |
 | `BIND_HOST` / `BIND_PORT` | Listen address — the IP your phone can reach (default port `8787`) |
 | `SESSION_NAME` | Telegram session file name (default `ringbearer`) |
