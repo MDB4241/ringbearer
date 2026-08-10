@@ -27,7 +27,8 @@ Pieces, if you ever need one alone:
   python ringbearer.py run      start the server only — non-interactive by design,
                             so launchd/systemd can never hang on a prompt
   python ringbearer.py probe    client-side diagnostic: connect like the phone
-                            would and call the tool (dry run; --live sends)
+                            would and call the tool (dry run; --live sends;
+                            --assistant <name> targets a mapped assistant)
   python ringbearer.py service  install the launchd agent — a real background
                             service (macOS; `service uninstall` removes it)
 
@@ -153,8 +154,46 @@ except ValueError:
 ASSISTANT_SLUG = re.sub(r"[^a-z0-9_]+", "_", ASSISTANT_NAME.lower()).strip("_") or "assistant"
 TOOL_NAME = f"send_to_{ASSISTANT_SLUG}"
 
+
+def parse_assistants(raw: str) -> dict:
+    """Extra assistants from ASSISTANTS: comma-separated name:chat pairs,
+    e.g. `plutus:@plutus_bot,quartermaster:@qm_bot`. Names are lowercase
+    tokens — they become enum values a speech-driven agent must reproduce,
+    so keep them short and speakable. Chats take the same forms as
+    ASSISTANT_CHAT. Raises ValueError naming the bad entry; blank means no
+    extras."""
+    roster: dict = {}
+    for pair in filter(None, (p.strip() for p in raw.split(","))):
+        name, sep, chat = (s.strip() for s in pair.partition(":"))
+        if not sep or not chat:
+            raise ValueError(f"{pair!r} is not a name:chat pair")
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+            raise ValueError(
+                f"assistant name {name!r} must be a lowercase token "
+                "(letters, digits, underscores; starts with a letter)"
+            )
+        if name in roster:
+            raise ValueError(f"duplicate assistant name {name!r}")
+        roster[name] = int(chat) if re.fullmatch(r"-?\d+", chat) else chat
+    return roster
+
+
+try:
+    _extras = parse_assistants(os.environ.get("ASSISTANTS", ""))
+except ValueError as e:
+    sys.exit(f"ASSISTANTS in .env is invalid: {e} — edit {STATE_DIR / '.env'}")
+if ASSISTANT_SLUG in _extras:
+    sys.exit(
+        f"ASSISTANTS name {ASSISTANT_SLUG!r} collides with ASSISTANT_NAME — "
+        f"the default assistant already answers to it. Edit {STATE_DIR / '.env'}."
+    )
+# The full routing table, default first. A single-assistant install has
+# exactly one row and never sees any of the multi-assistant machinery.
+DEFAULT_ASSISTANT = ASSISTANT_SLUG
+ASSISTANT_ROSTER = {DEFAULT_ASSISTANT: ASSISTANT_CHAT, **_extras}
+
 tg_client = None
-assistant_entity = None  # resolved once at startup; see lifespan
+assistant_entities: dict = {}  # roster name -> entity, resolved at startup; see lifespan
 
 
 def make_tg_client():
@@ -190,8 +229,8 @@ def delivery_mode_label() -> str:
     return "current Telegram conversation"
 
 
-async def create_topic(title: str) -> int:
-    """Create a fresh topic in the assistant chat and return its topic id.
+async def create_topic(title: str, peer) -> int:
+    """Create a fresh topic in `peer`'s chat and return its topic id.
 
     Telethon has no high-level helper for this, so it goes through the raw
     API. `messages.CreateForumTopicRequest` takes a generic peer (that is
@@ -204,10 +243,7 @@ async def create_topic(title: str) -> int:
     from telethon.tl.functions.messages import CreateForumTopicRequest
     from telethon.tl.types import MessageActionTopicCreate, UpdateMessageID
 
-    request = CreateForumTopicRequest(
-        peer=assistant_entity if assistant_entity is not None else ASSISTANT_CHAT,
-        title=title,
-    )
+    request = CreateForumTopicRequest(peer=peer, title=title)
     result = await tg_client(request)
     # The result is an Updates union: usually a container with .updates, but
     # UpdateShort carries a single .update — normalize both shapes.
@@ -233,22 +269,29 @@ async def create_topic(title: str) -> int:
     return scanned
 
 
-async def deliver(message: str) -> bool:
-    """Post into the assistant DM as the user. Returns True if actually sent."""
+async def deliver(message: str, assistant: str | None = None) -> bool:
+    """Post into the target assistant's DM as the user. Returns True if
+    actually sent. `assistant` is a roster name; None means the default."""
     if not (TELEGRAM_ENABLED and tg_client is not None):
         return False
+    name = assistant or DEFAULT_ASSISTANT
+    target = assistant_entities.get(name)
+    if target is None:
+        target = ASSISTANT_ROSTER[name]
     # Topic mode fails closed: if creation raises, nothing is sent — a
     # capture must never silently land in a thread the user didn't pick.
     # (The capture is still written to captures.jsonl by the caller.)
     reply_to = (
-        await create_topic(topic_title(message)) if NEW_TOPIC_PER_CAPTURE else None
+        await create_topic(topic_title(message), target)
+        if NEW_TOPIC_PER_CAPTURE
+        else None
     )
     # parse_mode=None: the transcript is a promise ("verbatim and in
     # full"), so *, _, ` and [] must arrive as characters, not formatting.
     # reply_to targets the topic's root service message, which threads the
     # send into that topic; None is Telethon's default (no threading).
     await tg_client.send_message(
-        assistant_entity if assistant_entity is not None else ASSISTANT_CHAT,
+        target,
         f"{RING_PREFIX}{message}",
         parse_mode=None,
         reply_to=reply_to,
@@ -260,43 +303,66 @@ async def deliver(message: str) -> bool:
 
 mcp = MCPServer("ringbearer")
 
-
-@mcp.tool(
-    name=TOOL_NAME,
-    description=(
-        f"Relay the user's spoken message to {ASSISTANT_NAME}, their personal "
-        "assistant. It handles ALL requests (reminders, questions, tasks, "
-        "notes, anything) and replies to the user directly in Telegram. This "
-        "is the only action available: for EVERY user message, call this tool "
-        "exactly once with the user's words verbatim and in full. Never "
-        "paraphrase, never summarize, never answer the user yourself, and "
-        "never skip the call — even for greetings, tests, or unclear speech."
-    ),
+_BASE_DESCRIPTION = (
+    f"Relay the user's spoken message to {ASSISTANT_NAME}, their personal "
+    "assistant. It handles ALL requests (reminders, questions, tasks, "
+    "notes, anything) and replies to the user directly in Telegram. This "
+    "is the only action available: for EVERY user message, call this tool "
+    "exactly once with the user's words verbatim and in full. Never "
+    "paraphrase, never summarize, never answer the user yourself, and "
+    "never skip the call — even for greetings, tests, or unclear speech."
 )
-async def send_to_assistant(message: str) -> str:
+
+
+async def relay(message: str, assistant: str) -> str:
+    """The tool body, shared by both registered signatures."""
+    # Server-side validation regardless of the schema enum: the schema is
+    # advisory to a cloud LLM. An off-roster name fails loud with the valid
+    # list — the user's words are never silently re-routed to a chat they
+    # didn't address — and the transcript is still logged.
+    if assistant not in ASSISTANT_ROSTER:
+        log_capture({
+            "received_at": datetime.now().astimezone().isoformat(),
+            "source": "mcp",
+            "transcription": message,
+            "assistant": assistant,
+            "forwarded": False,
+            "error": f"unknown assistant {assistant!r}",
+        })
+        print(f"[mcp] {TOOL_NAME}: unknown assistant {assistant!r}", flush=True)
+        return (
+            f"Unknown assistant {assistant!r} — valid: "
+            f"{', '.join(ASSISTANT_ROSTER)}. Not delivered; retry with one of "
+            "those, or omit the argument for the default."
+        )
+    route = f" -> {assistant}" if assistant != DEFAULT_ASSISTANT else ""
+
     # Probe guard: a DRYRUN-prefixed message exercises the whole path (auth,
-    # MCP dispatch, logging) without putting anything in the real assistant DM.
-    # Live probes are real messages to a real assistant — never send them casually.
+    # MCP dispatch, routing, logging) without putting anything in the real
+    # assistant DM. Live probes are real messages to a real assistant —
+    # never send them casually.
     if message.startswith(DRY_RUN_PREFIX):
         log_capture({
             "received_at": datetime.now().astimezone().isoformat(),
             "source": "mcp",
             "transcription": message,
+            "assistant": assistant,
             "forwarded": False,
             "dry_run": True,
         })
-        print(f"[mcp] {TOOL_NAME}: DRY RUN — not delivered", flush=True)
+        print(f"[mcp] {TOOL_NAME}{route}: DRY RUN — not delivered", flush=True)
         return "Dry run: received, not delivered to Telegram."
 
     started = time.monotonic()
 
     def finish(sent: bool, err: str | None) -> None:
         send_ms = round((time.monotonic() - started) * 1000)
-        print(f"[mcp] {TOOL_NAME}: telegram {send_ms}ms" + (f" ERROR {err}" if err else ""), flush=True)
+        print(f"[mcp] {TOOL_NAME}{route}: telegram {send_ms}ms" + (f" ERROR {err}" if err else ""), flush=True)
         row = {
             "received_at": datetime.now().astimezone().isoformat(),
             "source": "mcp",
             "transcription": message,
+            "assistant": assistant,
             "forwarded": sent,
             "telegram_ms": send_ms,
         }
@@ -308,7 +374,7 @@ async def send_to_assistant(message: str) -> str:
     try:
         # Bounded: a Telegram stall must not hold the transcript hostage —
         # timeout lands in the except and the capture row still gets written.
-        sent = await asyncio.wait_for(deliver(message), timeout=30)
+        sent = await asyncio.wait_for(deliver(message, assistant), timeout=30)
     except asyncio.CancelledError as e:
         # Cancellation (request dropped, server shutting down) is
         # BaseException, so the clause below never sees it — log the only
@@ -318,11 +384,55 @@ async def send_to_assistant(message: str) -> str:
     except Exception as e:  # the transcript is the only copy — log it no matter what
         sent, err = False, repr(e)
     finish(sent, err)
+    display = ASSISTANT_NAME if assistant == DEFAULT_ASSISTANT else assistant
     if sent:
-        return f"Delivered. {ASSISTANT_NAME} will reply in Telegram."
+        return f"Delivered. {display} will reply in Telegram."
     if err:
         return f"Logged locally, but Telegram delivery failed: {err}"
     return "Received and logged. (Telegram delivery not yet enabled.)"
+
+
+def register_capture_tool(server, roster):
+    """Register the send tool on `server`, shaped by the roster. Extra
+    assistants add an optional `assistant` argument whose enum IS the
+    discovery mechanism: the app's agent sees the valid names inside the
+    tool schema it fetches at connect — no listing round trip, nothing to
+    keep in sync by hand. A single-assistant install registers exactly the
+    historical signature; the feature is invisible until ASSISTANTS is set."""
+    if len(roster) > 1:
+        from typing import Annotated
+
+        from pydantic import Field
+
+        description = _BASE_DESCRIPTION + (
+            " The user has several assistants and this tool reaches them "
+            "all. If the user addresses one by name (e.g. 'ask plutus "
+            "...'), set `assistant` to that name; otherwise omit it for the "
+            "default. Routing only — the message itself still goes "
+            "verbatim, address phrase included."
+        )
+        # Advisory enum (json_schema_extra), NOT a Literal type: a Literal
+        # makes the SDK reject an off-enum value before the handler ever
+        # runs, and the transcript would vanish without a captures.jsonl
+        # row. The schema still shows the agent the valid names; relay()
+        # enforces them — and logs the words either way.
+        names = Annotated[str, Field(json_schema_extra={"enum": list(roster)})]
+
+        @server.tool(name=TOOL_NAME, description=description)
+        async def send_to_assistant(
+            message: str, assistant: names = DEFAULT_ASSISTANT
+        ) -> str:
+            return await relay(message, assistant)
+    else:
+
+        @server.tool(name=TOOL_NAME, description=_BASE_DESCRIPTION)
+        async def send_to_assistant(message: str) -> str:
+            return await relay(message, DEFAULT_ASSISTANT)
+
+    return send_to_assistant
+
+
+send_to_assistant = register_capture_tool(mcp, ASSISTANT_ROSTER)
 
 
 @mcp.prompt()
@@ -434,23 +544,25 @@ async def lifespan(app: FastAPI):
                 "terminated, or written by a different library) — delete it "
                 "and run: python ringbearer.py login"
             )
-        # Resolve the assistant chat once, up front. Numeric ids depend on the
+        # Resolve every roster chat once, up front. Numeric ids depend on the
         # session's entity cache and would otherwise fail on EVERY send —
         # silently, from the ring's point of view. Better: refuse to start,
-        # with the fix named.
-        global assistant_entity
-        try:
-            assistant_entity = await asyncio.wait_for(
-                tg_client.get_input_entity(ASSISTANT_CHAT), timeout=30
-            )
-        except Exception as e:
-            raise RuntimeError(
-                f"Can't resolve ASSISTANT_CHAT ({ASSISTANT_CHAT!r}): "
-                f"{type(e).__name__}: {e}\n"
-                "A numeric id only works for chats this account has already "
-                "seen from this session; the @username form always works — "
-                f"set it in {STATE_DIR / '.env'}."
-            ) from e
+        # with the assistant and the fix named. Strict on purpose: a typo'd
+        # mapping should die here, while the .env edit is fresh, not weeks
+        # later on a walk.
+        for _name, _chat in ASSISTANT_ROSTER.items():
+            try:
+                assistant_entities[_name] = await asyncio.wait_for(
+                    tg_client.get_input_entity(_chat), timeout=30
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Can't resolve assistant {_name!r} (chat {_chat!r}): "
+                    f"{type(e).__name__}: {e}\n"
+                    "A numeric id only works for chats this account has "
+                    "already seen from this session; the @username form "
+                    f"always works — set it in {STATE_DIR / '.env'}."
+                ) from e
         # Serving-phase flood policy, set only after the probes above: sleep
         # through short waits, but surface longer ones as FloodWaitError —
         # under Telethon's 60s default, deliver()'s 30s deadline would kill
@@ -722,6 +834,11 @@ def run() -> None:
 
     print(bold(f"ringbearer → http://{BIND_HOST}:{BIND_PORT}{MCP_MOUNT}/mcp"))
     print(f"Telegram delivery: {delivery_mode_label()}")
+    if len(ASSISTANT_ROSTER) > 1:
+        print("Assistants: " + ", ".join(
+            f"{n} (default)" if n == DEFAULT_ASSISTANT else n
+            for n in ASSISTANT_ROSTER
+        ))
     if not TELEGRAM_ENABLED:
         print(
             yellow(
@@ -733,11 +850,13 @@ def run() -> None:
     uvicorn.run(app, host=BIND_HOST, port=BIND_PORT)
 
 
-def probe(live: bool = False) -> None:
+def probe(live: bool = False, assistant: str | None = None) -> None:
     """Client-side diagnostic: connect exactly like the phone would —
     initialize, list tools, call the send tool. Dry run by default; the
     assistant DM is a live channel and --live sends a real message it will
-    act on. BRIDGE_URL overrides the target (e.g. probing a remote install)."""
+    act on. --assistant <name> targets a mapped assistant (see ASSISTANTS),
+    exercising the routing without the ring. BRIDGE_URL overrides the
+    target (e.g. probing a remote install)."""
     import logging
 
     import httpx2
@@ -751,17 +870,24 @@ def probe(live: bool = False) -> None:
     )
     text = "bridge probe, no reply needed"
     message = text if live else f"{DRY_RUN_PREFIX} {text}"
-    print(f"probing {url}" + (" (LIVE)" if live else " (dry run)"))
+    print(
+        f"probing {url}"
+        + (" (LIVE)" if live else " (dry run)")
+        + (f" -> assistant {assistant}" if assistant else "")
+    )
 
     async def _probe() -> None:
         headers = {"Authorization": f"Bearer {BRIDGE_TOKEN}"}
+        args = {"message": message}
+        if assistant:
+            args["assistant"] = assistant
         async with httpx2.AsyncClient(headers=headers, timeout=15) as http:
             async with streamable_http_client(url, http_client=http) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     tools = await session.list_tools()
                     print("tools:", [t.name for t in tools.tools])
-                    result = await session.call_tool(TOOL_NAME, {"message": message})
+                    result = await session.call_tool(TOOL_NAME, args)
                     print("result:", result.content[0].text)
 
     try:
@@ -950,7 +1076,13 @@ if __name__ == "__main__":
         elif cmd == "run":
             run()
         elif cmd == "probe":
-            probe(live="--live" in sys.argv)
+            target = None
+            if "--assistant" in sys.argv:
+                idx = sys.argv.index("--assistant")
+                if idx + 1 >= len(sys.argv):
+                    sys.exit("--assistant needs a name (see ASSISTANTS in .env)")
+                target = sys.argv[idx + 1]
+            probe(live="--live" in sys.argv, assistant=target)
         elif cmd == "service":
             service(uninstall=len(sys.argv) > 2 and sys.argv[2] == "uninstall")
         elif cmd == "":
