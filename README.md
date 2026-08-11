@@ -17,13 +17,8 @@ auditable in Telegram like any other conversation. Start something from the
 ring on a walk, finish it on your phone later.
 
 Works with any assistant that lives in a Telegram chat: Hermes, OpenClaw, a
-bot you wrote yourself. One Python file — FastAPI, the MCP SDK, Telethon.
-
-Set `NEW_TOPIC_PER_CAPTURE=true` to create a fresh topic for every capture
-instead — useful for assistants such as Hermes that keep separate context per
-Telegram topic. The tradeoff: each capture starts a clean conversation, so
-the ring only ever opens threads. Follow-ups happen from your phone, inside
-the topic the assistant replied in.
+bot you wrote yourself — and with several at once, routed by spoken name
+("ask plutus…"). One Python file — FastAPI, the MCP SDK, Telethon.
 
 ## How it works
 
@@ -47,10 +42,7 @@ sequenceDiagram
 The bridge exposes exactly **one MCP tool** — `send_to_assistant` — whose
 description tells the app's agent to relay every message verbatim and never
 answer itself. Your assistant's actual capabilities are never exposed to the
-app's cloud; it just gets a pipe. (Earlier releases derived the name from
-`ASSISTANT_NAME`, e.g. `send_to_hermes`. The app learns the new name from
-`tools/list` on its own — if a capture errors right after upgrading,
-re-select the MCP server group in the app to refresh its cached list.)
+app's cloud; it just gets a pipe.
 
 ## Quick start
 
@@ -94,9 +86,9 @@ Verify without touching your real DM:
 `probe` connects exactly like the phone would (same transport, same auth), so
 it bisects failures: probe succeeds → fix your phone settings; probe fails →
 fix server, network, or token. Set `BRIDGE_URL` to probe a remote install.
-The probe builds its token and tool name from the local config — if the
-target runs different settings, point `RINGBEARER_STATE_DIR` at that
-install's state directory too.
+The probe builds its token from the local config — if the target runs
+different settings, point `RINGBEARER_STATE_DIR` at that install's state
+directory too.
 
 There is also an offline test suite covering delivery routing, including the
 fail-closed topic path — `.venv/bin/python -m unittest` — no network, no
@@ -140,15 +132,26 @@ bind-mounted directory. See [`docker/README.md`](docker/README.md) for the
 minimal image, Compose example, interactive Telegram login, and deliberate
 Tailscale/LAN binding.
 
-## Upgrading from a Pyrogram-era install
+## Delivery modes
 
-Releases before the Telethon migration used Pyrogram for the Telegram layer;
-the two session formats are incompatible. After pulling: reinstall
-dependencies (`.venv/bin/pip install -r requirements.txt`), delete the old
-session file (`ringbearer.session`, unless you changed `SESSION_NAME`), and
-run `.venv/bin/python ringbearer.py login` once. Everything else — `.env`,
-phone settings, endpoints — carries over untouched. If the server starts
-before you've done this, it refuses with exactly this fix named.
+By default the bridge posts into the ongoing DM conversation: the assistant
+sees a normal message in a thread it already knows and replies with full
+context. Start something from the ring on a walk, finish it on your phone.
+
+Set `NEW_TOPIC_PER_CAPTURE=true` to create a fresh Telegram topic for every
+capture instead — useful for assistants such as Hermes that keep separate
+context per topic. The tradeoff: each capture starts a clean conversation,
+so the ring only ever opens threads. Follow-ups happen from your phone,
+inside the topic the assistant replied in.
+
+Topic mode has Telegram prerequisites — private-chat topics are a Bot API
+9.4 feature, off by default. In [@BotFather](https://t.me/BotFather), enable
+**Threaded Mode** on your assistant's bot (Bot Settings → Threads Settings)
+and keep "users can create topics" allowed. Then in the DM chat itself, tap
+the bot's name and flip the **Topics** toggle — it only appears after the
+BotFather change (restart Telegram if you don't see it). Topic creation
+fails closed: ringbearer logs the capture instead of silently sending it to
+another topic.
 
 ## Multiple assistants
 
@@ -169,8 +172,7 @@ goes to the default.
 An unknown name is refused with the valid list, and the capture still lands
 in `captures.jsonl` — words are never silently re-routed to a chat you
 didn't address. Every mapped chat is verified at startup, and topic mode
-applies to all of them: with `NEW_TOPIC_PER_CAPTURE=true`, enable Threaded
-Mode on each bot.
+applies to all of them: each mapped bot needs the prerequisites above.
 
 Test a mapping without the ring:
 
@@ -197,14 +199,6 @@ Without `ASSISTANTS` set, none of this exists — the tool keeps its single
 - **The session file is your Telegram account.** `*.session` is gitignored;
   treat it like a password. One process per session file — a second client on
   the same session risks `AUTH_KEY_DUPLICATED` and revocation.
-- **New-topic mode has Telegram prerequisites.** In [@BotFather](https://t.me/BotFather),
-  enable **Threaded Mode** on your assistant's bot (Bot Settings → Threads
-  Settings) and keep "users can create topics" allowed. Then in the DM chat
-  itself, tap the bot's name and flip the **Topics** toggle — it only appears
-  after the BotFather change (restart Telegram if you don't see it).
-  Private-chat topics are a Bot API 9.4 feature, off by default. Topic
-  creation fails closed: ringbearer logs the capture instead of silently
-  sending it to another topic.
 - **Probes are dry-run by default.** A live probe is a real message your real
   assistant will act on; `--live` is a deliberate flag for that reason.
 - **Captures are also logged locally.** Every transcript is appended verbatim
