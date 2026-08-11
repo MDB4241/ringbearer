@@ -38,16 +38,19 @@ sequenceDiagram
     Ring->>Phone: double-click-hold + speech
     Phone->>Phone: transcribe on device
     Phone->>Cloud: transcript + tool list
-    Cloud->>Phone: call send_to_*
+    Cloud->>Phone: call send_to_assistant
     Phone->>RB: tools/call (Streamable HTTP, bearer token)
     RB->>TG: post transcript as you (Telethon)
     TG->>TG: assistant replies in-thread
 ```
 
-The bridge exposes exactly **one MCP tool** — `send_to_<assistant>` — whose
+The bridge exposes exactly **one MCP tool** — `send_to_assistant` — whose
 description tells the app's agent to relay every message verbatim and never
 answer itself. Your assistant's actual capabilities are never exposed to the
-app's cloud; it just gets a pipe.
+app's cloud; it just gets a pipe. (Earlier releases derived the name from
+`ASSISTANT_NAME`, e.g. `send_to_hermes`. The app learns the new name from
+`tools/list` on its own — if a capture errors right after upgrading,
+re-select the MCP server group in the app to refresh its cached list.)
 
 ## Quick start
 
@@ -231,7 +234,7 @@ already set when the server starts (as the Docker image does for
 | `TELEGRAM_ENABLED` | `true` to actually deliver; `false` = log-only mode |
 | `NEW_TOPIC_PER_CAPTURE` | `true` creates a fresh Telegram topic for every capture (default `false`) |
 | `ASSISTANT_CHAT` | `@botusername` of the assistant DM (recommended; a numeric chat id works only for chats this account's session has already seen — the server verifies at startup) |
-| `ASSISTANT_NAME` | Display name; becomes the tool name (`Hermes` → `send_to_hermes`) |
+| `ASSISTANT_NAME` | Display name the tool description and acks use (`Hermes`); also names the default in the `assistant` enum |
 | `ASSISTANTS` | Optional extra assistants, `name:chat` pairs (`plutus:@plutus_bot,qm:@qm_bot`) — adds an `assistant` argument to the tool; see [Multiple assistants](#multiple-assistants) |
 | `TG_API_ID` / `TG_API_HASH` | Telegram API credentials (my.telegram.org) |
 | `BIND_HOST` / `BIND_PORT` | Listen address — the IP your phone can reach (default port `8787`) |

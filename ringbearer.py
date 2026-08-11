@@ -6,7 +6,7 @@ One does not simply type. Ringbearer carries your spoken words from the ring
 to your assistant, delivered as you.
 
 Double-click-hold the ring and speak. The Pebble app's MCP sandbox agent calls
-this bridge's send_to_<assistant> tool with the transcript, and the bridge
+this bridge's send_to_assistant tool with the transcript, and the bridge
 posts it into your Telegram DM with the assistant -- as you, from your own
 Telegram account -- so one thread carries the whole conversation and the
 assistant replies exactly as it would to a typed message.
@@ -148,11 +148,15 @@ try:
 except ValueError:
     sys.exit(f"BIND_PORT in .env is not a number — edit {STATE_DIR / '.env'}")
 
-# The tool name the ring app's LLM sees, e.g. send_to_hermes. Keep it free of
-# anything but [a-z0-9_]: the app sanitizes names for the LLM but dispatches on
-# the original, so exotic characters break the round-trip (reported upstream).
+# The tool name is fixed and generic: the destination is configuration, not
+# identity, so the name never has to change when assistants are renamed or
+# added — and `probe` works against any install without matching its config.
+# ASSISTANT_NAME still personalizes everything the app's LLM reads (the tool
+# description) and everything the user reads (acks, setup text).
+TOOL_NAME = "send_to_assistant"
+# The default assistant's roster/enum name, e.g. Hermes -> hermes. Slugged to
+# a lowercase token like every other roster name.
 ASSISTANT_SLUG = re.sub(r"[^a-z0-9_]+", "_", ASSISTANT_NAME.lower()).strip("_") or "assistant"
-TOOL_NAME = f"send_to_{ASSISTANT_SLUG}"
 
 
 def parse_assistants(raw: str) -> dict:
@@ -714,8 +718,8 @@ def setup() -> None:
     print("\n" + cyan("3. The Telegram chat your assistant lives in") + " — the DM transcripts should land in:")
     chat = ask("     ASSISTANT_CHAT (@botusername or chat id): ")
 
-    print("\n" + cyan("4. Your assistant's name") + " — becomes the MCP tool name the ring app's LLM sees")
-    print("   (e.g. 'Hermes' -> send_to_hermes):")
+    print("\n" + cyan("4. Your assistant's name") + " — how the tool describes your assistant")
+    print("   to the ring app's LLM, and how replies refer to it (e.g. 'Hermes'):")
     name = ask("     ASSISTANT_NAME [assistant]: ", default="assistant")
 
     # A container (or any wrapper) bakes BIND_HOST/BIND_PORT into the process
