@@ -140,9 +140,13 @@ context. Start something from the ring on a walk, finish it on your phone.
 
 Set `NEW_TOPIC_PER_CAPTURE=true` to create a fresh Telegram topic for every
 capture instead — useful for assistants such as Hermes that keep separate
-context per topic. The tradeoff: each capture starts a clean conversation,
-so the ring only ever opens threads. Follow-ups happen from your phone,
-inside the topic the assistant replied in.
+context per topic. Spoken follow-ups still work: in topic mode the tool
+gains an optional `thread` argument, and when your phrasing clearly
+continues the previous capture ("okay so, one more thing…") the app's agent
+can set it to `continue` — the bridge then posts into the last topic it
+created for that assistant instead of opening a new one. A new thread is
+the default and the safe fallback, and the bridge only consults its own
+record of topics it created — nothing is ever read from Telegram.
 
 Topic mode has Telegram prerequisites — private-chat topics are a Bot API
 9.4 feature, off by default. In [@BotFather](https://t.me/BotFather), enable
@@ -226,7 +230,7 @@ already set when the server starts (as the Docker image does for
 |---|---|
 | `BRIDGE_TOKEN` | Bearer token the phone must send (setup generates one) |
 | `TELEGRAM_ENABLED` | `true` to actually deliver; `false` = log-only mode |
-| `NEW_TOPIC_PER_CAPTURE` | `true` creates a fresh Telegram topic for every capture (default `false`) |
+| `NEW_TOPIC_PER_CAPTURE` | `true` creates a fresh Telegram topic for every capture (default `false`); also adds an optional `thread` argument so clearly-phrased follow-ups continue the last topic |
 | `ASSISTANT_CHAT` | `@botusername` of the assistant DM (recommended; a numeric chat id works only for chats this account's session has already seen — the server verifies at startup) |
 | `ASSISTANT_NAME` | Display name the tool description and acks use (`Hermes`); also names the default in the `assistant` enum |
 | `ASSISTANTS` | Optional extra assistants, `name:chat` pairs (`plutus:@plutus_bot,qm:@qm_bot`) — adds an `assistant` argument to the tool; see [Multiple assistants](#multiple-assistants) |
@@ -235,7 +239,7 @@ already set when the server starts (as the Docker image does for
 | `SESSION_NAME` | Telegram session file name (default `ringbearer`) |
 | `RING_PREFIX` | Prefix on relayed messages (default 🎤) |
 | `MCP_MOUNT` | Mount path; endpoint is `<MCP_MOUNT>/mcp` (default `/ringbearer`) |
-| `RINGBEARER_STATE_DIR` | Absolute directory for `.env`, Telegram session files, and captures (process environment only; defaults to this checkout). `service` bakes it into the launchd plist. |
+| `RINGBEARER_STATE_DIR` | Absolute directory for `.env`, Telegram session files, captures, and topic state (process environment only; defaults to this checkout). `service` bakes it into the launchd plist. |
 
 ## License
 
