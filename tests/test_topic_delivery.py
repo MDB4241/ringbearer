@@ -1,5 +1,8 @@
 import asyncio
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -110,15 +113,19 @@ class ParseAssistantsTests(unittest.TestCase):
 
 class ToolSchemaTests(unittest.TestCase):
     """Progressive disclosure lives in the schema: no ASSISTANTS, no
-    `assistant` argument — the phone-visible contract must not change for
-    single-assistant installs."""
+    `assistant` argument; no topic mode, no `thread` argument — the
+    phone-visible contract must not change for installs that configured
+    neither feature."""
 
-    def _schema(self, roster):
+    def _schema(self, roster, topics=False):
         from mcp.server import MCPServer
 
         server = MCPServer("schema-test")
         with patch.multiple(
-            ringbearer, ASSISTANT_ROSTER=roster, DEFAULT_ASSISTANT="assistant"
+            ringbearer,
+            ASSISTANT_ROSTER=roster,
+            DEFAULT_ASSISTANT="assistant",
+            NEW_TOPIC_PER_CAPTURE=topics,
         ):
             ringbearer.register_capture_tool(server, roster)
         (tool,) = asyncio.run(server.list_tools())
@@ -133,6 +140,24 @@ class ToolSchemaTests(unittest.TestCase):
         arg = schema["properties"]["assistant"]
         self.assertEqual(arg["enum"], ["assistant", "plutus"])
         self.assertEqual(arg["default"], "assistant")
+        self.assertEqual(schema["required"], ["message"])
+        self.assertNotIn("thread", schema["properties"])
+
+    def test_topic_mode_schema_gains_optional_thread(self):
+        schema = self._schema({"assistant": "@a"}, topics=True)
+        self.assertEqual(list(schema["properties"]), ["message", "thread"])
+        arg = schema["properties"]["thread"]
+        self.assertEqual(arg["enum"], ["new", "continue"])
+        self.assertEqual(arg["default"], "new")
+        self.assertEqual(schema["required"], ["message"])
+
+    def test_topic_mode_multi_assistant_schema_has_both_arguments(self):
+        schema = self._schema({"assistant": "@a", "plutus": "@p"}, topics=True)
+        self.assertEqual(
+            list(schema["properties"]), ["message", "assistant", "thread"]
+        )
+        self.assertEqual(schema["properties"]["assistant"]["enum"], ["assistant", "plutus"])
+        self.assertEqual(schema["properties"]["thread"]["enum"], ["new", "continue"])
         self.assertEqual(schema["required"], ["message"])
 
 
@@ -368,6 +393,148 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "Dry run: received, not delivered to Telegram.")
         self.assertEqual(rows[0]["assistant"], "plutus")
         self.assertTrue(rows[0]["dry_run"])
+
+
+class ThreadContinuationTests(unittest.IsolatedAsyncioTestCase):
+    """`thread="continue"` files into the last topic this bridge created —
+    from its own durable state, never from reading Telegram."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.pointer_file = Path(self._tmp.name) / "last_topics.json"
+        patcher = patch.object(ringbearer, "LAST_TOPICS", self.pointer_file)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def seed(self, pointers):
+        self.pointer_file.write_text(json.dumps(pointers))
+
+    def topic_mode(self, client, **extra_entities):
+        return patch.multiple(
+            ringbearer,
+            TELEGRAM_ENABLED=True,
+            NEW_TOPIC_PER_CAPTURE=True,
+            RING_PREFIX="mic: ",
+            tg_client=client,
+            **routing(self.default_entity, **extra_entities),
+        )
+
+    def setUpEntities(self):
+        self.default_entity = object()
+
+    async def asyncSetUp(self):
+        self.setUpEntities()
+
+    async def test_continue_replies_to_stored_topic(self):
+        self.seed({"assistant": 41})
+        client = FakeTelegramClient()
+        with self.topic_mode(client):
+            self.assertTrue(await ringbearer.deliver("okay so", thread="continue"))
+        self.assertEqual(client.requests, [])
+        self.assertEqual(
+            client.sent,
+            [(self.default_entity, "mic: okay so", {"parse_mode": None, "reply_to": 41})],
+        )
+
+    async def test_continue_is_per_assistant(self):
+        self.seed({"assistant": 41, "plutus": 77})
+        client = FakeTelegramClient()
+        plutus_entity = object()
+        with self.topic_mode(client, plutus=plutus_entity):
+            await ringbearer.deliver("okay so", "plutus", "continue")
+        self.assertEqual(client.requests, [])
+        self.assertEqual(
+            client.sent,
+            [(plutus_entity, "mic: okay so", {"parse_mode": None, "reply_to": 77})],
+        )
+
+    async def test_create_stores_pointer_durably(self):
+        client = FakeTelegramClient(topic_id=99)
+        with self.topic_mode(client):
+            await ringbearer.deliver("hello")
+        self.assertEqual(json.loads(self.pointer_file.read_text()), {"assistant": 99})
+        self.assertEqual(self.pointer_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(ringbearer.load_last_topic("assistant"), 99)
+
+    async def test_continue_without_pointer_falls_back_to_new(self):
+        client = FakeTelegramClient(topic_id=42)
+        with self.topic_mode(client):
+            self.assertTrue(await ringbearer.deliver("hello", thread="continue"))
+        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(client.sent[0][2]["reply_to"], 42)
+        self.assertEqual(ringbearer.load_last_topic("assistant"), 42)
+
+    async def test_corrupt_pointer_file_degrades_to_new(self):
+        self.pointer_file.write_text("not json {{")
+        client = FakeTelegramClient(topic_id=42)
+        with self.topic_mode(client):
+            self.assertTrue(await ringbearer.deliver("hello", thread="continue"))
+        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(client.sent[0][2]["reply_to"], 42)
+
+    async def test_junk_thread_value_means_new(self):
+        self.seed({"assistant": 41})
+        client = FakeTelegramClient(topic_id=42)
+        with self.topic_mode(client):
+            await ringbearer.deliver("hello", thread="followup")
+        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(client.sent[0][2]["reply_to"], 42)
+
+    async def test_dangling_pointer_names_recovery(self):
+        self.seed({"assistant": 41})
+        client = FakeTelegramClient(send_error=RuntimeError("MSG_ID_INVALID"))
+        with self.topic_mode(client):
+            with self.assertRaisesRegex(RuntimeError, 'retry with thread="new"'):
+                await ringbearer.deliver("okay so", thread="continue")
+        self.assertEqual(client.requests, [])
+
+    async def test_dm_mode_ignores_thread(self):
+        self.seed({"assistant": 41})
+        client = FakeTelegramClient()
+        with patch.multiple(
+            ringbearer,
+            TELEGRAM_ENABLED=True,
+            NEW_TOPIC_PER_CAPTURE=False,
+            RING_PREFIX="mic: ",
+            tg_client=client,
+            **routing(self.default_entity),
+        ):
+            self.assertTrue(await ringbearer.deliver("hello", thread="continue"))
+        self.assertEqual(client.requests, [])
+        self.assertEqual(
+            client.sent,
+            [(self.default_entity, "mic: hello", {"parse_mode": None, "reply_to": None})],
+        )
+
+
+class ThreadRowTests(unittest.IsolatedAsyncioTestCase):
+    """The captures row records the requested thread value verbatim in
+    topic mode, and stays untouched in DM mode."""
+
+    async def _relay(self, message, thread, topics):
+        rows = []
+        with (
+            patch.multiple(ringbearer, NEW_TOPIC_PER_CAPTURE=topics, **routing(object())),
+            patch.object(ringbearer, "deliver", AsyncMock(return_value=True)),
+            patch.object(ringbearer, "log_capture", rows.append),
+            patch("builtins.print"),
+        ):
+            await ringbearer.relay(message, "assistant", thread)
+        return rows[0]
+
+    async def test_topic_mode_row_carries_requested_thread_verbatim(self):
+        row = await self._relay("hello", "followup", topics=True)
+        self.assertEqual(row["thread"], "followup")
+
+    async def test_dry_run_row_carries_thread_in_topic_mode(self):
+        row = await self._relay(f"{ringbearer.DRY_RUN_PREFIX} probe", "continue", topics=True)
+        self.assertEqual(row["thread"], "continue")
+        self.assertTrue(row["dry_run"])
+
+    async def test_dm_mode_row_has_no_thread_field(self):
+        row = await self._relay("hello", "continue", topics=False)
+        self.assertNotIn("thread", row)
 
 
 class DurableLoggingTests(unittest.IsolatedAsyncioTestCase):

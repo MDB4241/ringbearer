@@ -3,6 +3,7 @@
 !.env.example
 *.session*
 captures.jsonl
+last_topics.json
 .venv/
 __pycache__/
 logs/

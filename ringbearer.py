@@ -28,7 +28,8 @@ Pieces, if you ever need one alone:
                             so launchd/systemd can never hang on a prompt
   python ringbearer.py probe    client-side diagnostic: connect like the phone
                             would and call the tool (dry run; --live sends;
-                            --assistant <name> targets a mapped assistant)
+                            --assistant <name> targets a mapped assistant;
+                            --thread <new|continue> exercises topic threading)
   python ringbearer.py service  install the launchd agent — a real background
                             service (macOS; `service uninstall` removes it)
 
@@ -82,6 +83,7 @@ STATE_DIR = (Path(_state_raw).expanduser() if _state_raw else HERE).resolve()
 load_dotenv(STATE_DIR / ".env")
 
 CAPTURES = STATE_DIR / "captures.jsonl"
+LAST_TOPICS = STATE_DIR / "last_topics.json"
 DRY_RUN_PREFIX = "DRYRUN:"
 
 # Terminal color helpers — plain when piped or NO_COLOR is set.
@@ -222,6 +224,36 @@ def log_capture(row: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def load_last_topic(assistant: str) -> int | None:
+    """The topic id this bridge last created for `assistant`, or None.
+    Corrupt or missing state degrades to None — the cost is a fresh
+    thread, never a refused delivery."""
+    try:
+        value = json.loads(LAST_TOPICS.read_text()).get(assistant)
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, int) else None
+
+
+def store_last_topic(assistant: str, topic_id: int) -> None:
+    """Remember the topic just created, per assistant, across restarts.
+    Best-effort on purpose: the pointer is filing state, and a filing
+    problem must never fail a delivery that already has a topic to land
+    in — so a write error is logged, not raised."""
+    try:
+        current = json.loads(LAST_TOPICS.read_text())
+        if not isinstance(current, dict):
+            current = {}
+    except (OSError, ValueError):
+        current = {}
+    current[assistant] = topic_id
+    try:
+        LAST_TOPICS.touch(mode=0o600, exist_ok=True)
+        LAST_TOPICS.write_text(json.dumps(current))
+    except OSError as e:
+        print(f"[state] couldn't record last topic for {assistant}: {e!r}", flush=True)
+
+
 def topic_title(message: str) -> str:
     normalized = " ".join(message.split())
     return normalized[:80] or "Ring capture"
@@ -273,33 +305,56 @@ async def create_topic(title: str, peer) -> int:
     return scanned
 
 
-async def deliver(message: str, assistant: str | None = None) -> bool:
+async def deliver(message: str, assistant: str | None = None, thread: str = "new") -> bool:
     """Post into the target assistant's DM as the user. Returns True if
-    actually sent. `assistant` is a roster name; None means the default."""
+    actually sent. `assistant` is a roster name; None means the default.
+    `thread` matters only in topic mode: "continue" threads into the last
+    topic this bridge created for that assistant; anything else is a fresh
+    topic. The words themselves are never touched either way."""
     if not (TELEGRAM_ENABLED and tg_client is not None):
         return False
     name = assistant or DEFAULT_ASSISTANT
     target = assistant_entities.get(name)
     if target is None:
         target = ASSISTANT_ROSTER[name]
-    # Topic mode fails closed: if creation raises, nothing is sent — a
-    # capture must never silently land in a thread the user didn't pick.
-    # (The capture is still written to captures.jsonl by the caller.)
-    reply_to = (
-        await create_topic(topic_title(message), target)
-        if NEW_TOPIC_PER_CAPTURE
-        else None
-    )
+    reply_to = None
+    continuing = False
+    if NEW_TOPIC_PER_CAPTURE:
+        # Anything but an exact "continue" means a fresh thread: a junk
+        # value still reaches the right assistant, so filing conservatively
+        # beats refusing delivery over a threading nuance. (Contrast with
+        # `assistant`, where a wrong value means a wrong RECIPIENT and is
+        # rejected loudly in relay().)
+        if thread == "continue":
+            reply_to = load_last_topic(name)
+            continuing = reply_to is not None
+        if reply_to is None:
+            # Topic mode fails closed: if creation raises, nothing is sent
+            # — a capture must never silently land in a thread the user
+            # didn't pick. (The capture row is still written by the caller.)
+            reply_to = await create_topic(topic_title(message), target)
+            store_last_topic(name, reply_to)
     # parse_mode=None: the transcript is a promise ("verbatim and in
     # full"), so *, _, ` and [] must arrive as characters, not formatting.
     # reply_to targets the topic's root service message, which threads the
     # send into that topic; None is Telethon's default (no threading).
-    await tg_client.send_message(
-        target,
-        f"{RING_PREFIX}{message}",
-        parse_mode=None,
-        reply_to=reply_to,
-    )
+    try:
+        await tg_client.send_message(
+            target,
+            f"{RING_PREFIX}{message}",
+            parse_mode=None,
+            reply_to=reply_to,
+        )
+    except Exception as e:
+        if continuing:
+            # A remembered topic can be deleted out from under the pointer.
+            # Name the recovery so the app's agent can retry within its
+            # tool-round budget — the error text is the self-heal path.
+            raise RuntimeError(
+                f"continuing the last thread failed ({type(e).__name__}: {e})"
+                ' — the topic may be gone; retry with thread="new"'
+            ) from e
+        raise
     return True
 
 
@@ -318,8 +373,8 @@ _BASE_DESCRIPTION = (
 )
 
 
-async def relay(message: str, assistant: str) -> str:
-    """The tool body, shared by both registered signatures."""
+async def relay(message: str, assistant: str, thread: str = "new") -> str:
+    """The tool body, shared by every registered signature."""
     # Server-side validation regardless of the schema enum: the schema is
     # advisory to a cloud LLM. An off-roster name fails loud with the valid
     # list — the user's words are never silently re-routed to a chat they
@@ -346,14 +401,17 @@ async def relay(message: str, assistant: str) -> str:
     # assistant DM. Live probes are real messages to a real assistant —
     # never send them casually.
     if message.startswith(DRY_RUN_PREFIX):
-        log_capture({
+        row = {
             "received_at": datetime.now().astimezone().isoformat(),
             "source": "mcp",
             "transcription": message,
             "assistant": assistant,
             "forwarded": False,
             "dry_run": True,
-        })
+        }
+        if NEW_TOPIC_PER_CAPTURE:
+            row["thread"] = thread
+        log_capture(row)
         print(f"[mcp] {TOOL_NAME}{route}: DRY RUN — not delivered", flush=True)
         return "Dry run: received, not delivered to Telegram."
 
@@ -370,6 +428,10 @@ async def relay(message: str, assistant: str) -> str:
             "forwarded": sent,
             "telegram_ms": send_ms,
         }
+        if NEW_TOPIC_PER_CAPTURE:
+            # The value as requested, verbatim — so a misfiled capture is
+            # diagnosable from the row alone.
+            row["thread"] = thread
         if err:
             row["error"] = err
         log_capture(row)
@@ -378,7 +440,7 @@ async def relay(message: str, assistant: str) -> str:
     try:
         # Bounded: a Telegram stall must not hold the transcript hostage —
         # timeout lands in the except and the capture row still gets written.
-        sent = await asyncio.wait_for(deliver(message, assistant), timeout=30)
+        sent = await asyncio.wait_for(deliver(message, assistant, thread), timeout=30)
     except asyncio.CancelledError as e:
         # Cancellation (request dropped, server shutting down) is
         # BaseException, so the clause below never sees it — log the only
@@ -397,39 +459,74 @@ async def relay(message: str, assistant: str) -> str:
 
 
 def register_capture_tool(server, roster):
-    """Register the send tool on `server`, shaped by the roster. Extra
-    assistants add an optional `assistant` argument whose enum IS the
+    """Register the send tool on `server`, shaped by the configuration.
+    Extra assistants add an optional `assistant` argument whose enum IS the
     discovery mechanism: the app's agent sees the valid names inside the
     tool schema it fetches at connect — no listing round trip, nothing to
-    keep in sync by hand. A single-assistant install registers exactly the
-    historical signature; the feature is invisible until ASSISTANTS is set."""
-    if len(roster) > 1:
-        from typing import Annotated
-
-        from pydantic import Field
-
-        description = _BASE_DESCRIPTION + (
+    keep in sync by hand. Topic mode adds an optional `thread` argument the
+    same way, so clearly-phrased follow-ups can continue the last topic.
+    A single-assistant install without topic mode registers exactly the
+    historical signature; each feature is invisible until configured."""
+    multi = len(roster) > 1
+    topics = NEW_TOPIC_PER_CAPTURE
+    description = _BASE_DESCRIPTION
+    if multi:
+        description += (
             " The user has several assistants and this tool reaches them "
             "all. If the user addresses one by name (e.g. 'ask plutus "
             "...'), set `assistant` to that name; otherwise omit it for the "
             "default. Routing only — the message itself still goes "
             "verbatim, address phrase included."
         )
-        # Advisory enum (json_schema_extra), NOT a Literal type: a Literal
+    if topics:
+        description += (
+            " Each message starts a fresh conversation thread by default. "
+            "Set `thread` to 'continue' ONLY when the user's words clearly "
+            "continue their previous message — a follow-up question, 'okay "
+            "so...', 'one more thing'. When unsure, omit it: a new thread "
+            "is always safe."
+        )
+    if multi or topics:
+        from typing import Annotated
+
+        from pydantic import Field
+
+        # Advisory enums (json_schema_extra), NOT Literal types: a Literal
         # makes the SDK reject an off-enum value before the handler ever
         # runs, and the transcript would vanish without a captures.jsonl
-        # row. The schema still shows the agent the valid names; relay()
-        # enforces them — and logs the words either way.
-        names = Annotated[str, Field(json_schema_extra={"enum": list(roster)})]
+        # row. The schema still shows the agent the valid values; relay()
+        # and deliver() enforce them — and log the words either way.
+        if multi:
+            names = Annotated[str, Field(json_schema_extra={"enum": list(roster)})]
+        if topics:
+            threads = Annotated[
+                str, Field(json_schema_extra={"enum": ["new", "continue"]})
+            ]
+
+    if multi and topics:
+
+        @server.tool(name=TOOL_NAME, description=description)
+        async def send_to_assistant(
+            message: str,
+            assistant: names = DEFAULT_ASSISTANT,
+            thread: threads = "new",
+        ) -> str:
+            return await relay(message, assistant, thread)
+    elif multi:
 
         @server.tool(name=TOOL_NAME, description=description)
         async def send_to_assistant(
             message: str, assistant: names = DEFAULT_ASSISTANT
         ) -> str:
             return await relay(message, assistant)
+    elif topics:
+
+        @server.tool(name=TOOL_NAME, description=description)
+        async def send_to_assistant(message: str, thread: threads = "new") -> str:
+            return await relay(message, DEFAULT_ASSISTANT, thread)
     else:
 
-        @server.tool(name=TOOL_NAME, description=_BASE_DESCRIPTION)
+        @server.tool(name=TOOL_NAME, description=description)
         async def send_to_assistant(message: str) -> str:
             return await relay(message, DEFAULT_ASSISTANT)
 
@@ -854,13 +951,14 @@ def run() -> None:
     uvicorn.run(app, host=BIND_HOST, port=BIND_PORT)
 
 
-def probe(live: bool = False, assistant: str | None = None) -> None:
+def probe(live: bool = False, assistant: str | None = None, thread: str | None = None) -> None:
     """Client-side diagnostic: connect exactly like the phone would —
     initialize, list tools, call the send tool. Dry run by default; the
     assistant DM is a live channel and --live sends a real message it will
     act on. --assistant <name> targets a mapped assistant (see ASSISTANTS),
-    exercising the routing without the ring. BRIDGE_URL overrides the
-    target (e.g. probing a remote install)."""
+    and --thread <new|continue> exercises topic-mode threading, both
+    without the ring. BRIDGE_URL overrides the target (e.g. probing a
+    remote install)."""
     import logging
 
     import httpx2
@@ -878,6 +976,7 @@ def probe(live: bool = False, assistant: str | None = None) -> None:
         f"probing {url}"
         + (" (LIVE)" if live else " (dry run)")
         + (f" -> assistant {assistant}" if assistant else "")
+        + (f" thread={thread}" if thread else "")
     )
 
     async def _probe() -> None:
@@ -885,6 +984,8 @@ def probe(live: bool = False, assistant: str | None = None) -> None:
         args = {"message": message}
         if assistant:
             args["assistant"] = assistant
+        if thread:
+            args["thread"] = thread
         async with httpx2.AsyncClient(headers=headers, timeout=15) as http:
             async with streamable_http_client(url, http_client=http) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -1080,13 +1181,18 @@ if __name__ == "__main__":
         elif cmd == "run":
             run()
         elif cmd == "probe":
-            target = None
+            target = thread = None
             if "--assistant" in sys.argv:
                 idx = sys.argv.index("--assistant")
                 if idx + 1 >= len(sys.argv):
                     sys.exit("--assistant needs a name (see ASSISTANTS in .env)")
                 target = sys.argv[idx + 1]
-            probe(live="--live" in sys.argv, assistant=target)
+            if "--thread" in sys.argv:
+                idx = sys.argv.index("--thread")
+                if idx + 1 >= len(sys.argv):
+                    sys.exit("--thread needs a value (new or continue)")
+                thread = sys.argv[idx + 1]
+            probe(live="--live" in sys.argv, assistant=target, thread=thread)
         elif cmd == "service":
             service(uninstall=len(sys.argv) > 2 and sys.argv[2] == "uninstall")
         elif cmd == "":
