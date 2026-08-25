@@ -20,6 +20,9 @@ services:
     volumes:
       - ./data:/data
     restart: unless-stopped
+    # start_period is 30s because the check now waits on a real Telegram round
+    # trip, not just an open port: a slow first connect must not read as a
+    # failure. After that, an unhealthy container means Telegram is unreachable.
     healthcheck:
       test:
         - CMD
@@ -31,4 +34,4 @@ services:
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 10s
+      start_period: 30s

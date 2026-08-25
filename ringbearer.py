@@ -34,7 +34,8 @@ Pieces, if you ever need one alone:
 
 Endpoints:
   <MCP_MOUNT>/mcp   MCP server (Streamable HTTP), bearer-token gated.
-  /healthz          Open liveness check.
+  /healthz          Open health check: 200 when Telegram is reachable,
+                    503 when it is not. Talks to no one; reads state.
 """
 
 import sys
@@ -46,16 +47,17 @@ import asyncio
 import hmac
 import json
 import os
+import random
 import re
 import socket
 import sys
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from mcp.server import MCPServer
 
@@ -200,7 +202,7 @@ tg_client = None
 assistant_entities: dict = {}  # roster name -> entity, resolved at startup; see lifespan
 
 
-def make_tg_client():
+def make_tg_client(*, serving: bool = False):
     from telethon import TelegramClient
 
     # The session path is explicit and absolute, so the server and
@@ -209,11 +211,235 @@ def make_tg_client():
     # No flood_sleep_threshold override here: this factory also serves
     # login/setup, where Telethon's default sleeping is the right behavior.
     # The serving-phase policy is set in lifespan, after the startup probes.
+    #
+    # serving=True hands reconnection to connection_supervisor(). Telethon's
+    # own policy is five attempts a second apart and then a permanent teardown
+    # (mtprotosender.py: _reconnect falls through to _disconnect), which is how
+    # a brief home-internet drop used to end the bridge for good while the
+    # process stayed up. Two loops racing to reconnect would each be half in
+    # charge, so this one is switched off and the policy lives in one place.
+    policy = (
+        {"connection_retries": 0, "retry_delay": 0, "auto_reconnect": False}
+        if serving
+        else {}
+    )
     return TelegramClient(
         str(STATE_DIR / SESSION_NAME),
         int(TG_API_ID),
         TG_API_HASH,
+        **policy,
     )
+
+
+# --- Connection health --------------------------------------------------------
+#
+# The bridge has to survive the network going away, which on a home connection
+# it does regularly. Telethon alone does not survive it: five retries a second
+# apart, then the session is torn down permanently while the process carries on
+# serving a health check that only ever said "Telegram is configured". Nothing
+# exited, so nothing restarted, and the ring stayed dead until someone noticed.
+#
+# So: unbounded reconnection on exponential backoff, and a health view built on
+# whether a round trip actually completed.
+
+RECONNECT_BACKOFF_START = 1.0  # seconds before the first retry
+RECONNECT_BACKOFF_CAP = 60.0  # ceiling; keep knocking once a minute, forever
+RECONNECT_JITTER = 0.2  # +/- fraction, so restarts don't fall into lockstep
+HEALTH_POLL_INTERVAL = 30.0  # seconds between round trips while healthy
+HEALTH_STALE_AFTER = 90.0  # no verified round trip in this long is not "up"
+CONNECT_TIMEOUT = 30.0
+PING_TIMEOUT = 15.0
+
+
+class ConnectionHealth:
+    """What the bridge knows about its own link to Telegram.
+
+    Deliberately not `client.is_connected()`. That reports the socket and stays
+    True while Telethon retries underneath, so it reads healthy during exactly
+    the window this class exists to describe. The load-bearing fact is the last
+    time a round trip completed.
+    """
+
+    def __init__(self) -> None:
+        self.last_ok: float | None = None  # monotonic, last verified round trip
+        self.attempts = 0  # consecutive failures; 0 whenever the link is good
+        self.next_retry_in: float | None = None
+        self.last_error: str | None = None
+        self.fatal: str | None = None  # auth-class failure; retrying cannot fix it
+
+    def mark_ok(self) -> None:
+        self.last_ok = time.monotonic()
+        self.attempts = 0
+        self.next_retry_in = None
+        self.last_error = None
+
+    def mark_failure(self, error: str, next_retry_in: float) -> None:
+        self.attempts += 1
+        self.last_error = error
+        self.next_retry_in = next_retry_in
+
+    def mark_fatal(self, error: str) -> None:
+        self.fatal = error
+        self.last_error = error
+        self.next_retry_in = None
+
+    @property
+    def up(self) -> bool:
+        """True only when a round trip completed recently and nothing has failed
+        since. The staleness arm is the backstop: if the supervisor task dies,
+        `last_ok` ages out and health goes red without a second watchdog."""
+        if self.fatal or self.attempts or self.last_ok is None:
+            return False
+        return (time.monotonic() - self.last_ok) <= HEALTH_STALE_AFTER
+
+    def snapshot(self) -> dict:
+        if not TELEGRAM_ENABLED:
+            state = "disabled"
+        elif self.fatal:
+            state = "fatal"
+        elif self.up:
+            state = "up"
+        else:
+            state = "down"
+        age = None if self.last_ok is None else round(time.monotonic() - self.last_ok, 1)
+        return {
+            "state": state,
+            "last_ok_age_s": age,
+            "failed_attempts": self.attempts,
+            "next_retry_s": (
+                None if self.next_retry_in is None else round(self.next_retry_in, 1)
+            ),
+            "error": self.last_error,
+        }
+
+
+tg_health = ConnectionHealth()
+recheck_now: asyncio.Event | None = None  # created in lifespan
+
+
+def request_recheck() -> None:
+    """Wake the supervisor early. A send that just failed is evidence about the
+    link, so health should turn red in a second rather than at the next poll."""
+    if recheck_now is not None:
+        recheck_now.set()
+
+
+async def boot_connect(attempts: int = 5, delay: float = 1.0) -> None:
+    """Connect at startup with the tolerance Telethon used to provide.
+
+    The serving client has Telethon's retry loop switched off, so without this a
+    single slow moment at boot would be a hard start failure where it used to be
+    five one-second attempts. FloodWaitError is not an OSError and so still
+    reaches lifespan's handler on the first try, un-slept.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            await asyncio.wait_for(tg_client.connect(), timeout=CONNECT_TIMEOUT)
+            return
+        except (OSError, asyncio.TimeoutError):
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(delay)
+
+
+async def verify_connection(*, rebuild: bool = False) -> None:
+    """One real round trip to Telegram, reconnecting first if the socket is gone.
+
+    Raises on any failure; the caller decides what the failure means. Ping is the
+    cheapest call that proves the far end is answering, which `is_connected()`
+    does not.
+
+    `rebuild` tears the connection down before reconnecting instead of trusting
+    `is_connected()`, and the supervisor sets it after any failure. Two reasons,
+    both load-bearing. A client can report connected while the far end is gone:
+    `connect()` marks the sender connected before its layer-init call returns and
+    creates the keepalive task only at the very end, so a timeout landing in that
+    window leaves the flag stuck True with nothing left to notice it, and every
+    later poll pings a corpse forever. And on the ordinary path, Telethon's own
+    teardown leaves `_update_loop` running while `connect()` overwrites its
+    handle, so without an explicit disconnect one update loop leaks per
+    reconnect, each issuing its own calls against the account.
+    """
+    from telethon.tl.functions import PingRequest
+
+    if rebuild:
+        # This connection is being discarded either way, so failing to close it
+        # politely is not interesting. (CancelledError is a BaseException and
+        # still propagates.)
+        with suppress(Exception):
+            await asyncio.wait_for(tg_client.disconnect(), timeout=CONNECT_TIMEOUT)
+    if rebuild or not tg_client.is_connected():
+        await asyncio.wait_for(tg_client.connect(), timeout=CONNECT_TIMEOUT)
+    await asyncio.wait_for(
+        tg_client(PingRequest(ping_id=random.getrandbits(63))), timeout=PING_TIMEOUT
+    )
+
+
+def backoff_after(delay: float) -> float:
+    """The next nominal delay: double it, ceiling at the cap."""
+    return min(delay * 2, RECONNECT_BACKOFF_CAP)
+
+
+def jittered(delay: float) -> float:
+    return delay * (1 + random.uniform(-RECONNECT_JITTER, RECONNECT_JITTER))
+
+
+async def connection_supervisor() -> None:
+    """Keep the Telegram link alive for as long as the process runs.
+
+    Unbounded on purpose: an outage is a long wait, not a failure, so there is no
+    attempt limit and no give-up. The single exit is an auth-class error, where
+    retrying forever would bury a revoked session under a retry counter instead
+    of saying the one thing that fixes it.
+    """
+    # Two families, not one. UnauthorizedError (401) covers revoked, terminated
+    # and deactivated. AuthKeyError (406) is separate and holds
+    # AuthKeyDuplicatedError, which Telegram raises when one session key is used
+    # from two places at once — the exact thing the README warns about, and a key
+    # it has already killed. Retrying either family is knocking on a dead door.
+    from telethon.errors import AuthKeyError, UnauthorizedError
+    from telethon.errors.common import AuthKeyNotFound
+
+    delay = RECONNECT_BACKOFF_START
+    while True:
+        try:
+            await verify_connection(rebuild=tg_health.attempts > 0)
+        except asyncio.CancelledError:
+            raise
+        except (UnauthorizedError, AuthKeyError, AuthKeyNotFound) as e:
+            tg_health.mark_fatal(f"{type(e).__name__}: {e}")
+            print(
+                f"[tg] Telegram rejected this session ({type(e).__name__}). That is "
+                "not an outage, so it will not be retried. Fix: "
+                "python ringbearer.py login",
+                flush=True,
+            )
+            return
+        except Exception as e:
+            wait = jittered(delay)
+            tg_health.mark_failure(f"{type(e).__name__}: {e}", wait)
+            print(
+                f"[tg] link down ({type(e).__name__}: {e}) — attempt "
+                f"{tg_health.attempts}, retrying in {wait:.0f}s",
+                flush=True,
+            )
+            await asyncio.sleep(wait)
+            delay = backoff_after(delay)
+            continue
+
+        if tg_health.attempts:
+            print(
+                f"[tg] link restored after {tg_health.attempts} failed attempt(s)",
+                flush=True,
+            )
+        tg_health.mark_ok()
+        delay = RECONNECT_BACKOFF_START
+        if recheck_now is None:
+            await asyncio.sleep(HEALTH_POLL_INTERVAL)
+            continue
+        recheck_now.clear()
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(recheck_now.wait(), timeout=HEALTH_POLL_INTERVAL)
 
 
 def log_capture(row: dict) -> None:
@@ -300,6 +526,7 @@ async def deliver(message: str, assistant: str | None = None) -> bool:
         parse_mode=None,
         reply_to=reply_to,
     )
+    tg_health.mark_ok()
     return True
 
 
@@ -387,6 +614,9 @@ async def relay(message: str, assistant: str) -> str:
         raise
     except Exception as e:  # the transcript is the only copy — log it no matter what
         sent, err = False, repr(e)
+        # Evidence about the link, arriving between polls: let the supervisor
+        # confirm or clear it now instead of at the next tick.
+        request_recheck()
     finish(sent, err)
     display = ASSISTANT_NAME if assistant == DEFAULT_ASSISTANT else assistant
     if sent:
@@ -481,7 +711,8 @@ class McpMethodLogger:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global tg_client
+    global tg_client, recheck_now
+    supervisor = None
     if not BRIDGE_TOKEN:
         raise RuntimeError(
             "BRIDGE_TOKEN is not set — refusing to start unauthenticated. "
@@ -504,13 +735,24 @@ async def lifespan(app: FastAPI):
         # file at the same path dies right here with an sqlite error, so the
         # migration advice must wrap construction, not just connect().
         try:
-            tg_client = make_tg_client()
+            tg_client = make_tg_client(serving=True)
         except Exception as e:
             raise RuntimeError(
                 f"Can't open {SESSION_NAME}.session ({type(e).__name__}: {e}).\n"
                 f"If it predates the Telethon migration (Pyrogram), delete it "
                 f"and run: python ringbearer.py login"
             ) from e
+        # Serving-phase flood policy, set BEFORE the probes below rather than
+        # after them: sleep through short waits, surface longer ones as
+        # FloodWaitError. Every probe here carries a 30s deadline, so under
+        # Telethon's 60s default a 31-60s flood wait would be slept internally,
+        # killed by that deadline, and arrive as a bare timeout — landing in the
+        # generic handler, whose advice is to delete the session. Deleting a
+        # healthy login during a flood wait is the worst available move, and the
+        # FloodWaitError branch below exists precisely to prevent it. deliver()
+        # has the same 30s deadline and the same reason to want this.
+        # login/setup keep Telethon's default via the untouched factory.
+        tg_client.flood_sleep_threshold = 25
         # connect(), never start(): start() would prompt for a phone number on
         # an unauthorized session, and this path must stay launchd-safe. A bad
         # session fails fast with the fix named instead of a crash-loop
@@ -518,7 +760,7 @@ async def lifespan(app: FastAPI):
         # Bounded like deliver(): a half-open connection must not leave the
         # lifespan pending forever with /healthz never binding.
         try:
-            await asyncio.wait_for(tg_client.connect(), timeout=30)
+            await boot_connect()
             # get_me(), never is_user_authorized(): the latter swallows EVERY
             # RPC error into False — a flood wait would read as "revoked" and
             # the advice below would tell the user to delete a healthy session
@@ -567,14 +809,19 @@ async def lifespan(app: FastAPI):
                     "already seen from this session; the @username form "
                     f"always works — set it in {STATE_DIR / '.env'}."
                 ) from e
-        # Serving-phase flood policy, set only after the probes above: sleep
-        # through short waits, but surface longer ones as FloodWaitError —
-        # under Telethon's 60s default, deliver()'s 30s deadline would kill
-        # the sleep mid-nap and log a generic timeout instead of the real
-        # error. login/setup keep the default via the untouched factory.
-        tg_client.flood_sleep_threshold = 25
+        # The get_me() above was a real round trip, so the link starts verified
+        # rather than merely assumed. From here the supervisor owns it: it holds
+        # the connection open for the life of the process, and it is what makes
+        # /healthz able to answer honestly.
+        tg_health.mark_ok()
+        recheck_now = asyncio.Event()
+        supervisor = asyncio.create_task(connection_supervisor())
     async with mcp.session_manager.run():
         yield
+    if supervisor is not None:
+        supervisor.cancel()
+        with suppress(asyncio.CancelledError):
+            await supervisor
     if tg_client is not None:
         await tg_client.disconnect()
 
@@ -614,8 +861,20 @@ app.mount(
 
 
 @app.get("/healthz")
-async def healthz():
-    return {"ok": True, "telegram": TELEGRAM_ENABLED}
+async def healthz(response: Response):
+    """Report whether Telegram is actually reachable, not whether it is enabled.
+
+    503 when it is not: the shipped Docker healthcheck calls urlopen, which
+    raises on any non-2xx, so an existing deployment gets the new signal without
+    editing its compose file. This handler never talks to Telegram — it reads
+    state the supervisor maintains — so an open, unauthenticated endpoint
+    cannot be polled into API traffic no matter how hard anyone hits it.
+    """
+    connection = tg_health.snapshot()
+    degraded = TELEGRAM_ENABLED and not tg_health.up
+    if degraded:
+        response.status_code = 503
+    return {"ok": not degraded, "telegram": TELEGRAM_ENABLED, "connection": connection}
 
 
 # --- CLI ----------------------------------------------------------------------

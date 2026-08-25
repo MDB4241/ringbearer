@@ -183,6 +183,35 @@ Test a mapping without the ring:
 Without `ASSISTANTS` set, none of this exists — the tool keeps its single
 `message` argument.
 
+## Network outages
+
+A background supervisor owns the Telegram connection, and Telethon's own
+reconnect policy is switched off so that exactly one thing is in charge of it.
+When the connection drops, the supervisor retries on exponential backoff: one
+second, doubling to a ceiling of one minute, jittered, with no attempt limit and
+no give-up. When the link comes back, the next ring press goes through and there
+is nothing to restart by hand.
+
+`/healthz` reports what is actually true:
+
+```json
+{"ok": true, "telegram": true,
+ "connection": {"state": "up", "last_ok_age_s": 4.2, "failed_attempts": 0,
+                "next_retry_s": null, "error": null}}
+```
+
+`state` is `up`, `down`, `fatal`, or `disabled`, and it comes from the last
+completed round trip to Telegram rather than from the socket: a socket reports
+healthy while the client underneath is failing to reconnect. **When Telegram is
+enabled and unreachable, `/healthz` answers 503**, which the Docker healthcheck
+picks up as an unhealthy container with no change to your compose file. Reading
+the endpoint never costs a Telegram API call, so an open endpoint cannot be
+polled into rate-limit trouble.
+
+`fatal` means Telegram rejected the session: revoked, terminated, or logged out
+elsewhere. That is not an outage, so the supervisor stops instead of hiding it
+behind a growing retry counter. Run `python ringbearer.py login` again.
+
 ## Security notes
 
 - **Your words pass through Pebble's cloud.** The phone transcribes on device,
@@ -195,7 +224,9 @@ Without `ASSISTANTS` set, none of this exists — the tool keeps its single
   internet; WireGuard makes plain HTTP acceptable inside the tailnet. Never
   port-forward this.
 - **The bearer token is the gate.** Everything except `/healthz` requires it;
-  the server refuses to start without one. Comparison is constant-time.
+  the server refuses to start without one. Comparison is constant-time. The open
+  endpoint carries no captures and no config — only whether Telegram is
+  currently reachable.
 - **The session file is your Telegram account.** `*.session` is gitignored;
   treat it like a password. One process per session file — a second client on
   the same session risks `AUTH_KEY_DUPLICATED` and revocation.
