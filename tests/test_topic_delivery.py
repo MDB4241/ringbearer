@@ -55,6 +55,7 @@ def routing(entity, **extra_entities):
         DEFAULT_ASSISTANT="assistant",
         ASSISTANT_ROSTER=roster,
         assistant_entities=entities,
+        DELIVERY_CONTEXT="conversation",
     )
 
 
@@ -79,6 +80,36 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(
                 ringbearer.delivery_mode_label(), "current Telegram conversation"
             )
+
+
+class DeliveryContextTests(unittest.TestCase):
+    def test_conversation_context_preserves_existing_message_shape(self):
+        with patch.multiple(
+            ringbearer, DELIVERY_CONTEXT="conversation", RING_PREFIX="mic: "
+        ):
+            self.assertEqual(ringbearer.format_delivery_message("hello"), "mic: hello")
+
+    def test_one_shot_context_explains_the_noninteractive_contract(self):
+        with patch.multiple(
+            ringbearer, DELIVERY_CONTEXT="one_shot", RING_PREFIX="mic: "
+        ):
+            formatted = ringbearer.format_delivery_message("send the report")
+
+        self.assertTrue(formatted.startswith("mic: [RING CAPTURE: ONE-SHOT]"))
+        self.assertIn("may not see any reply", formatted)
+        self.assertIn("execute it now without asking for confirmation", formatted)
+        self.assertIn("Resolve minor ambiguity", formatted)
+        self.assertIn("leave a concise blocker", formatted)
+        self.assertTrue(formatted.endswith("Transcript:\nsend the report"))
+
+    def test_one_shot_context_preserves_transcript_verbatim(self):
+        transcript = "  Keep *this* exactly.\nSecond line [still literal].  "
+        with patch.multiple(
+            ringbearer, DELIVERY_CONTEXT="one_shot", RING_PREFIX="mic: "
+        ):
+            formatted = ringbearer.format_delivery_message(transcript)
+
+        self.assertEqual(formatted.split("Transcript:\n", 1)[1], transcript)
 
 
 class ParseAssistantsTests(unittest.TestCase):

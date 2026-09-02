@@ -129,6 +129,12 @@ _chat = os.environ.get("ASSISTANT_CHAT", "")
 ASSISTANT_CHAT = int(_chat) if re.fullmatch(r"-?\d+", _chat) else _chat
 ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "assistant")
 RING_PREFIX = os.environ.get("RING_PREFIX", "\U0001f3a4 ")
+DELIVERY_CONTEXT = os.environ.get("DELIVERY_CONTEXT", "conversation").lower()
+if DELIVERY_CONTEXT not in {"conversation", "one_shot"}:
+    sys.exit(
+        "DELIVERY_CONTEXT must be 'conversation' or 'one_shot' "
+        f"(got: {DELIVERY_CONTEXT!r})"
+    )
 TG_API_ID = os.environ.get("TG_API_ID", "")
 if TG_API_ID and not TG_API_ID.isdigit():
     sys.exit(f"TG_API_ID in .env is not a number — edit {STATE_DIR / '.env'}")
@@ -459,6 +465,24 @@ def delivery_mode_label() -> str:
     return "current Telegram conversation"
 
 
+def format_delivery_message(message: str) -> str:
+    """Add recipient-side context without changing the captured transcript."""
+    if DELIVERY_CONTEXT == "conversation":
+        return f"{RING_PREFIX}{message}"
+    return (
+        f"{RING_PREFIX}[RING CAPTURE: ONE-SHOT]\n"
+        "The user is speaking through an Index 01 ring and may not see any reply. "
+        "If this message requests an action, treat the spoken request as "
+        "authorization and execute it now without asking for confirmation. "
+        "Resolve minor ambiguity using reasonable, low-risk defaults and known "
+        "context. If essential information is unavailable, or the action would "
+        "be materially unsafe or irreversible, do not invent it; leave a concise "
+        "blocker for the user to find later. Report the outcome briefly after "
+        "attempting the action.\n\n"
+        f"Transcript:\n{message}"
+    )
+
+
 async def create_topic(title: str, peer) -> int:
     """Create a fresh topic in `peer`'s chat and return its topic id.
 
@@ -522,7 +546,7 @@ async def deliver(message: str, assistant: str | None = None) -> bool:
     # send into that topic; None is Telethon's default (no threading).
     await tg_client.send_message(
         target,
-        f"{RING_PREFIX}{message}",
+        format_delivery_message(message),
         parse_mode=None,
         reply_to=reply_to,
     )
@@ -1015,6 +1039,7 @@ def setup() -> None:
         f"BRIDGE_TOKEN={token}\n"
         "TELEGRAM_ENABLED=true\n"
         "NEW_TOPIC_PER_CAPTURE=false\n"
+        "DELIVERY_CONTEXT=conversation\n"
         f"ASSISTANT_CHAT={chat}\n"
         f"ASSISTANT_NAME={name}\n"
         f"TG_API_ID={api_id}\n"
