@@ -153,6 +153,30 @@ BotFather change (restart Telegram if you don't see it). Topic creation
 fails closed: ringbearer logs the capture instead of silently sending it to
 another topic.
 
+### One-shot ring context
+
+Normal chat assumes the user can read a reply and answer a follow-up question.
+That assumption is wrong when they are walking around speaking into a ring. Set:
+
+```env
+DELIVERY_CONTEXT=one_shot
+```
+
+Ringbearer then wraps the verbatim transcript in a short recipient-side
+instruction explaining that the user may not see the reply. An actionable
+request is treated as authorization to act now: the assistant should not ask
+for confirmation, should resolve minor ambiguity with reasonable low-risk
+defaults, and should report the result briefly. If essential information is
+missing, or an action would be materially unsafe or irreversible, it should
+leave a concise blocker rather than inventing details or waiting for a live
+answer.
+
+The default is `conversation`, which preserves the historical message shape
+and normal back-and-forth behaviour. This setting changes only what the target
+assistant receives. Captures remain logged verbatim, topic titles still use
+the raw transcript, and the Pebble cloud agent remains a relay rather than an
+executor.
+
 ## Multiple assistants
 
 One bridge can carry to more than one assistant. Map the extras in `.env`:
@@ -258,6 +282,7 @@ already set when the server starts (as the Docker image does for
 | `BRIDGE_TOKEN` | Bearer token the phone must send (setup generates one) |
 | `TELEGRAM_ENABLED` | `true` to actually deliver; `false` = log-only mode |
 | `NEW_TOPIC_PER_CAPTURE` | `true` creates a fresh Telegram topic for every capture (default `false`) |
+| `DELIVERY_CONTEXT` | Recipient-side handling contract: `conversation` preserves normal chat; `one_shot` tells the assistant to act without waiting for follow-up (default `conversation`) |
 | `ASSISTANT_CHAT` | `@botusername` of the assistant DM (recommended; a numeric chat id works only for chats this account's session has already seen — the server verifies at startup) |
 | `ASSISTANT_NAME` | Display name the tool description and acks use (`Hermes`); also names the default in the `assistant` enum |
 | `ASSISTANTS` | Optional extra assistants, `name:chat` pairs (`plutus:@plutus_bot,qm:@qm_bot`) — adds an `assistant` argument to the tool; see [Multiple assistants](#multiple-assistants) |
