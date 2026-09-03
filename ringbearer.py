@@ -255,6 +255,7 @@ HEALTH_POLL_INTERVAL = 30.0  # seconds between round trips while healthy
 HEALTH_STALE_AFTER = 90.0  # no verified round trip in this long is not "up"
 CONNECT_TIMEOUT = 30.0
 PING_TIMEOUT = 15.0
+SUPERVISOR_RESTART_DELAY = 5.0  # after the supervisor itself dies of something unplanned
 
 
 class ConnectionHealth:
@@ -272,6 +273,11 @@ class ConnectionHealth:
         self.next_retry_in: float | None = None
         self.last_error: str | None = None
         self.fatal: str | None = None  # auth-class failure; retrying cannot fix it
+        # Connections Telethon tore down on its own that the supervisor then
+        # rebuilt. Not failures — no probe of ours failed — but the number
+        # that would have read "840" during the fifteen-hour churn of
+        # 2026-09-01, when every other field on /healthz looked fine.
+        self.rebuilds = 0
 
     def mark_ok(self) -> None:
         self.last_ok = time.monotonic()
@@ -316,6 +322,7 @@ class ConnectionHealth:
                 None if self.next_retry_in is None else round(self.next_retry_in, 1)
             ),
             "error": self.last_error,
+            "rebuilds": self.rebuilds,
         }
 
 
@@ -365,20 +372,56 @@ async def verify_connection(*, rebuild: bool = False) -> None:
     teardown leaves `_update_loop` running while `connect()` overwrites its
     handle, so without an explicit disconnect one update loop leaks per
     reconnect, each issuing its own calls against the account.
+
+    A socket Telethon already tore down on its own is rebuilt the same way,
+    counted in `rebuilds` rather than as a failure — never patched with a bare
+    `connect()`, for the same leak reason.
     """
     from telethon.tl.functions import PingRequest
 
+    if not rebuild and not tg_client.is_connected():
+        # Telethon tore the link down by itself: with its retries off, its
+        # _reconnect ends in _disconnect, and no probe of ours failed on the
+        # way. Still a full rebuild. The old update and keepalive tasks are
+        # cancelled only by disconnect(), and connect() would start a second
+        # pair beside them — the "Fatal error handling updates" tracebacks of
+        # 2026-09-02 were several update loops applying one difference to one
+        # message box, one leaked pair per silent reconnect, 840 of them.
+        tg_health.rebuilds += 1
+        print("[tg] link torn down underneath the supervisor — rebuilding", flush=True)
+        rebuild = True
     if rebuild:
         # This connection is being discarded either way, so failing to close it
         # politely is not interesting. (CancelledError is a BaseException and
         # still propagates.)
         with suppress(Exception):
             await asyncio.wait_for(tg_client.disconnect(), timeout=CONNECT_TIMEOUT)
-    if rebuild or not tg_client.is_connected():
         await asyncio.wait_for(tg_client.connect(), timeout=CONNECT_TIMEOUT)
+        clear_stale_keepalive_ping()
     await asyncio.wait_for(
         tg_client(PingRequest(ping_id=random.getrandbits(63))), timeout=PING_TIMEOUT
     )
+
+
+def clear_stale_keepalive_ping() -> None:
+    """Forget the keepalive ping Telethon lost with the old connection.
+
+    Telethon 1.44 tracks its own keepalive ping in `MTProtoSender._ping` and
+    clears it only when the matching pong arrives (mtprotosender.py:743). When
+    the link dies with that ping in flight, Telethon's own reconnect re-sends
+    every pending request, so the pong comes and the field clears. Ours cannot:
+    with `auto_reconnect=False` its teardown drops every pending request
+    (`_disconnect` → `_pending_state.clear()`), and the connection the
+    supervisor builds next inherits the stale id. From then on every keepalive
+    tick (60s) reads the stale id as "the last ping never came back" and tears
+    the fresh link down (`_keepalive_ping` → `_start_reconnect`). That ran once
+    a minute for fifteen hours on 2026-09-01/02 — 840 teardowns — until one of
+    them landed mid-probe and killed the supervisor. Private attribute, pinned
+    library version, guarded so a stub client in tests needs no sender.
+    """
+    sender = getattr(tg_client, "_sender", None)
+    if sender is not None and hasattr(sender, "_ping"):
+        sender._ping = None
 
 
 def backoff_after(delay: float) -> float:
@@ -408,10 +451,21 @@ async def connection_supervisor() -> None:
 
     delay = RECONNECT_BACKOFF_START
     while True:
+        failure: Exception | None = None
         try:
             await verify_connection(rebuild=tg_health.attempts > 0)
         except asyncio.CancelledError:
-            raise
+            if asyncio.current_task().cancelling():
+                raise  # lifespan is shutting the process down
+            # Not this task's cancellation. When Telethon tears a connection
+            # down without an error (mtprotosender._disconnect, error=None) it
+            # cancels the future of every in-flight request, and a cancelled
+            # future raises CancelledError into whoever awaits it — here, the
+            # health ping. The task itself was never cancelled, and
+            # cancelling() is the only thing that tells the two apart. On
+            # 2026-09-02 this read as shutdown, the loop re-raised, and the
+            # ring was dead for a day with nothing left to reconnect it.
+            failure = ConnectionError("Telegram tore the connection down mid-request")
         except (UnauthorizedError, AuthKeyError, AuthKeyNotFound) as e:
             tg_health.mark_fatal(f"{type(e).__name__}: {e}")
             print(
@@ -422,10 +476,13 @@ async def connection_supervisor() -> None:
             )
             return
         except Exception as e:
+            failure = e
+
+        if failure is not None:
             wait = jittered(delay)
-            tg_health.mark_failure(f"{type(e).__name__}: {e}", wait)
+            tg_health.mark_failure(f"{type(failure).__name__}: {failure}", wait)
             print(
-                f"[tg] link down ({type(e).__name__}: {e}) — attempt "
+                f"[tg] link down ({type(failure).__name__}: {failure}) — attempt "
                 f"{tg_health.attempts}, retrying in {wait:.0f}s",
                 flush=True,
             )
@@ -446,6 +503,36 @@ async def connection_supervisor() -> None:
         recheck_now.clear()
         with suppress(asyncio.TimeoutError):
             await asyncio.wait_for(recheck_now.wait(), timeout=HEALTH_POLL_INTERVAL)
+
+
+async def keep_supervising() -> None:
+    """Run the supervisor for the life of the process, restarting it if it dies
+    of anything it did not plan for.
+
+    The supervisor ends on purpose in exactly two ways: cancelled by lifespan at
+    shutdown, or returned after an auth-class failure. Anything else is a bug,
+    and the right response to a bug in the one thing keeping the ring alive is
+    to say so and start it again — not to leave /healthz red until a person
+    notices, which is how 2026-09-02 went. The death is marked as a failure so
+    the restarted loop rebuilds the connection instead of trusting it.
+    """
+    while True:
+        try:
+            await connection_supervisor()
+            return
+        except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
+            reason = "CancelledError from a cancelled future"
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+        tg_health.mark_failure(f"supervisor died ({reason})", SUPERVISOR_RESTART_DELAY)
+        print(
+            f"[tg] supervisor died ({reason}) — restarting in "
+            f"{SUPERVISOR_RESTART_DELAY:.0f}s",
+            flush=True,
+        )
+        await asyncio.sleep(SUPERVISOR_RESTART_DELAY)
 
 
 def log_capture(row: dict) -> None:
@@ -631,11 +718,18 @@ async def relay(message: str, assistant: str) -> str:
         # timeout lands in the except and the capture row still gets written.
         sent = await asyncio.wait_for(deliver(message, assistant), timeout=30)
     except asyncio.CancelledError as e:
-        # Cancellation (request dropped, server shutting down) is
-        # BaseException, so the clause below never sees it — log the only
-        # copy of the transcript first, then propagate it bare.
-        finish(False, repr(e))
-        raise
+        if asyncio.current_task().cancelling():
+            # Cancellation (request dropped, server shutting down) is
+            # BaseException, so the clause below never sees it — log the only
+            # copy of the transcript first, then propagate it bare.
+            finish(False, repr(e))
+            raise
+        # A cancelled future, not a cancelled request: Telethon cancels the
+        # send's future when it tears the connection down mid-send. To the ring
+        # that is a failed delivery like any other — logged, reported, and the
+        # supervisor nudged. Same class as connection_supervisor's handler.
+        sent, err = False, "ConnectionError: Telegram tore the connection down mid-send"
+        request_recheck()
     except Exception as e:  # the transcript is the only copy — log it no matter what
         sent, err = False, repr(e)
         # Evidence about the link, arriving between polls: let the supervisor
@@ -839,7 +933,7 @@ async def lifespan(app: FastAPI):
         # /healthz able to answer honestly.
         tg_health.mark_ok()
         recheck_now = asyncio.Event()
-        supervisor = asyncio.create_task(connection_supervisor())
+        supervisor = asyncio.create_task(keep_supervising())
     async with mcp.session_manager.run():
         yield
     if supervisor is not None:

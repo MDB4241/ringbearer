@@ -411,5 +411,239 @@ class HealthEndpointTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls, 0)
 
 
+class TeardownTests(unittest.IsolatedAsyncioTestCase):
+    """2026-09-01/02: fifteen hours of Telethon tearing the link down once a
+    minute, then one teardown that landed mid-ping and killed the supervisor.
+    Three failures held still: the CancelledError that read as shutdown, the
+    bare connect() that leaked an update loop per cycle, and the stale
+    keepalive ping that caused the churn in the first place."""
+
+    def setUp(self):
+        ringbearer.tg_health = ringbearer.ConnectionHealth()
+
+    async def test_a_cancelled_ping_future_is_a_link_failure_not_shutdown(self):
+        """Telethon cancels every in-flight request's future when it tears a
+        connection down without an error. That CancelledError reaches the
+        supervisor's await exactly like task cancellation would — and must
+        not end the loop, because nobody cancelled the task."""
+        loop = asyncio.get_running_loop()
+
+        class TornMidPing:
+            def is_connected(self):
+                return True
+
+            async def __call__(self, request):
+                fut = loop.create_future()
+                loop.call_soon(fut.cancel)  # what _disconnect(error=None) does
+                await fut
+
+        sleeper = SleepRecorder(limit=1)
+        with (
+            patch.multiple(
+                ringbearer, tg_client=TornMidPing(), TELEGRAM_ENABLED=True, recheck_now=None
+            ),
+            patch("ringbearer.asyncio.sleep", sleeper),
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(StopLoop):  # reached the retry sleep: still looping
+                await ringbearer.connection_supervisor()
+            self.assertEqual(ringbearer.tg_health.snapshot()["state"], "down")
+
+        self.assertEqual(ringbearer.tg_health.attempts, 1)
+        self.assertIn("tore the connection down", ringbearer.tg_health.last_error)
+
+    async def test_lifespan_cancellation_still_stops_the_loop(self):
+        """The discrimination must not swallow the real thing."""
+        started = asyncio.Event()
+
+        async def hangs(*, rebuild=False):
+            started.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch.multiple(ringbearer, verify_connection=hangs, recheck_now=None),
+            patch("builtins.print"),
+        ):
+            task = asyncio.create_task(ringbearer.connection_supervisor())
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(task.cancelled())
+        self.assertEqual(ringbearer.tg_health.attempts, 0)
+
+    async def test_a_link_telethon_tore_down_is_rebuilt_not_patched(self):
+        """A bare connect() on a torn-down client leaves the old update and
+        keepalive tasks running beside the new pair — one leaked pair per
+        cycle, 840 cycles. A socket that is gone is a rebuild, and counted."""
+        from types import SimpleNamespace
+
+        class Torn:
+            def __init__(self):
+                self.connected = False
+                self.disconnects = 0
+                self.connects = 0
+                self._sender = SimpleNamespace(_ping=-345396399915620271)
+
+            def is_connected(self):
+                return self.connected
+
+            async def disconnect(self):
+                self.disconnects += 1
+
+            async def connect(self):
+                self.connects += 1
+                self.connected = True
+
+            async def __call__(self, request):
+                return object()
+
+        client = Torn()
+        sleeper = SleepRecorder(limit=1)
+        with (
+            patch.multiple(
+                ringbearer, tg_client=client, TELEGRAM_ENABLED=True, recheck_now=None
+            ),
+            patch("ringbearer.asyncio.sleep", sleeper),
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(StopLoop):
+                await ringbearer.connection_supervisor()
+
+        self.assertEqual((client.disconnects, client.connects), (1, 1))
+        self.assertEqual(ringbearer.tg_health.attempts, 0)  # nothing failed
+        self.assertEqual(ringbearer.tg_health.rebuilds, 1)
+        self.assertEqual(ringbearer.tg_health.snapshot()["rebuilds"], 1)
+        self.assertTrue(ringbearer.tg_health.up)
+        self.assertIsNone(client._sender._ping)  # the stale keepalive ping is gone
+
+    async def test_a_rebuild_after_a_failure_also_clears_the_stale_keepalive_ping(self):
+        """Telethon clears _ping only on the matching pong. Its own reconnect
+        re-sends the pending ping so the pong arrives; with auto_reconnect off
+        the teardown drops it, and every keepalive tick afterwards reads the
+        stale id as a lost pong and tears the fresh link down. Once a minute,
+        for fifteen hours."""
+        from types import SimpleNamespace
+
+        class FailsOnceThenFine:
+            def __init__(self):
+                self.pings = 0
+                self._sender = SimpleNamespace(_ping=12345)
+
+            def is_connected(self):
+                return True
+
+            async def disconnect(self):
+                pass
+
+            async def connect(self):
+                pass
+
+            async def __call__(self, request):
+                self.pings += 1
+                if self.pings == 1:
+                    raise OSError("connection reset")
+                return object()
+
+        client = FailsOnceThenFine()
+        sleeper = SleepRecorder(limit=2)  # one backoff, then the healthy poll
+        with (
+            patch.multiple(
+                ringbearer, tg_client=client, TELEGRAM_ENABLED=True, recheck_now=None
+            ),
+            patch("ringbearer.asyncio.sleep", sleeper),
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(StopLoop):
+                await ringbearer.connection_supervisor()
+        self.assertIsNone(client._sender._ping)
+        self.assertEqual(ringbearer.tg_health.attempts, 0)
+
+    def test_clearing_the_ping_tolerates_clients_without_a_sender(self):
+        with patch.object(ringbearer, "tg_client", object()):
+            ringbearer.clear_stale_keepalive_ping()  # no AttributeError
+
+
+class StopRunner(BaseException):
+    """Ends keep_supervising() from the test side. BaseException on purpose:
+    the runner catches Exception, and that catch is the thing under test."""
+
+
+class SupervisorLifetimeTests(unittest.IsolatedAsyncioTestCase):
+    """The supervisor is the one thing keeping the ring alive, so its own
+    death is the failure it has to survive."""
+
+    def setUp(self):
+        ringbearer.tg_health = ringbearer.ConnectionHealth()
+
+    async def test_an_unplanned_death_restarts_the_supervisor(self):
+        runs = []
+
+        async def dies_once():
+            runs.append(1)
+            if len(runs) == 1:
+                raise RuntimeError("stdout went away")
+            raise StopRunner()
+
+        sleeper = SleepRecorder(limit=5)
+        with (
+            patch.object(ringbearer, "connection_supervisor", dies_once),
+            patch("ringbearer.asyncio.sleep", sleeper),
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(StopRunner):
+                await ringbearer.keep_supervising()
+
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(sleeper.delays, [ringbearer.SUPERVISOR_RESTART_DELAY])
+        self.assertIn("supervisor died", ringbearer.tg_health.last_error)
+        self.assertIn("stdout went away", ringbearer.tg_health.last_error)
+        self.assertEqual(ringbearer.tg_health.attempts, 1)  # the next pass rebuilds
+
+    async def test_a_stray_cancellation_restarts_it_too(self):
+        runs = []
+
+        async def cancelled_by_a_future():
+            runs.append(1)
+            if len(runs) == 1:
+                raise asyncio.CancelledError()  # the task was never cancelled
+            raise StopRunner()
+
+        sleeper = SleepRecorder(limit=5)
+        with (
+            patch.object(ringbearer, "connection_supervisor", cancelled_by_a_future),
+            patch("ringbearer.asyncio.sleep", sleeper),
+            patch("builtins.print"),
+        ):
+            with self.assertRaises(StopRunner):
+                await ringbearer.keep_supervising()
+        self.assertEqual(len(runs), 2)
+
+    async def test_a_planned_stop_is_not_restarted(self):
+        """Returning is the auth-fatal exit; cancellation is lifespan."""
+        runs = []
+
+        async def stops():
+            runs.append(1)
+
+        with patch.object(ringbearer, "connection_supervisor", stops), patch("builtins.print"):
+            await ringbearer.keep_supervising()
+        self.assertEqual(len(runs), 1)
+
+        started = asyncio.Event()
+
+        async def hangs():
+            started.set()
+            await asyncio.Event().wait()
+
+        with patch.object(ringbearer, "connection_supervisor", hangs), patch("builtins.print"):
+            task = asyncio.create_task(ringbearer.keep_supervising())
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(task.cancelled())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -216,12 +216,20 @@ second, doubling to a ceiling of one minute, jittered, with no attempt limit and
 no give-up. When the link comes back, the next ring press goes through and there
 is nothing to restart by hand.
 
+Telethon can also drop the link by itself, with no probe of the supervisor's
+failing on the way. That is treated as a rebuild rather than a failure: the
+supervisor closes what is left, reconnects, and counts it in `rebuilds`, so a
+link being torn down over and over shows up as a climbing number instead of a
+quiet one. If the supervisor itself ever dies of something unplanned, it is
+logged and restarted after five seconds; the only ways it stops on purpose are
+shutdown and a fatal session.
+
 `/healthz` reports what is actually true:
 
 ```json
 {"ok": true, "telegram": true,
  "connection": {"state": "up", "last_ok_age_s": 4.2, "failed_attempts": 0,
-                "next_retry_s": null, "error": null}}
+                "next_retry_s": null, "error": null, "rebuilds": 0}}
 ```
 
 `state` is `up`, `down`, `fatal`, or `disabled`, and it comes from the last

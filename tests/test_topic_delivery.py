@@ -406,18 +406,49 @@ class DurableLoggingTests(unittest.IsolatedAsyncioTestCase):
     written no matter how delivery dies."""
 
     async def test_cancellation_still_logs_capture(self):
+        """A real cancellation — the request dropped, the server shutting
+        down — logs the only copy of the transcript and then propagates."""
+        rows = []
+        started = asyncio.Event()
+
+        async def hangs(message, assistant=None):
+            started.set()
+            await asyncio.Event().wait()
+
+        with (
+            patch.object(ringbearer, "deliver", hangs),
+            patch.object(ringbearer, "log_capture", rows.append),
+            patch("builtins.print"),
+        ):
+            task = asyncio.create_task(ringbearer.send_to_assistant("hello"))
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["forwarded"])
+        self.assertIn("CancelledError", rows[0]["error"])
+
+    async def test_a_cancelled_send_future_is_a_failed_delivery_not_a_dropped_request(self):
+        """Telethon cancels the send's future when it tears the connection
+        down mid-send. Nobody cancelled the request, so the ring gets a
+        delivery failure and the supervisor gets nudged — not a bare
+        CancelledError out of the tool handler."""
         rows = []
         deliver = AsyncMock(side_effect=asyncio.CancelledError)
         with (
             patch.object(ringbearer, "deliver", deliver),
             patch.object(ringbearer, "log_capture", rows.append),
+            patch.object(ringbearer, "request_recheck") as recheck,
             patch("builtins.print"),
         ):
-            with self.assertRaises(asyncio.CancelledError):
-                await ringbearer.send_to_assistant("hello")
+            result = await ringbearer.send_to_assistant("hello")
+        self.assertIn("delivery failed", result)
+        self.assertIn("tore the connection down", result)
         self.assertEqual(len(rows), 1)
         self.assertFalse(rows[0]["forwarded"])
-        self.assertIn("CancelledError", rows[0]["error"])
+        self.assertIn("tore the connection down", rows[0]["error"])
+        recheck.assert_called_once()
 
     async def test_delivery_error_still_logs_capture(self):
         rows = []
