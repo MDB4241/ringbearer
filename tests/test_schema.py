@@ -26,7 +26,8 @@ FIXTURES = TESTS / "fixtures"
 # The capture, run in a subprocess. Only the import lines at the top move when
 # the module layout changes; everything below them is the contract itself.
 CAPTURE = """
-from ringbearer import app, mcp
+from ringbearer.app import app
+from ringbearer.route.mcp import mcp
 
 import asyncio
 import json

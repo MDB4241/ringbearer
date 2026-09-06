@@ -12,6 +12,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ringbearer.py .env.example ./
+COPY ringbearer/ ./ringbearer/
 
 RUN useradd --create-home --uid 1000 ringbearer \
     && mkdir /data \

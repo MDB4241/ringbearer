@@ -18,7 +18,7 @@ ring on a walk, finish it on your phone later.
 
 Works with any assistant that lives in a Telegram chat: Hermes, OpenClaw, a
 bot you wrote yourself — and with several at once, routed by spoken name
-("ask plutus…"). One Python file — FastAPI, the MCP SDK, Telethon.
+("ask plutus…"). One small Python package — FastAPI, the MCP SDK, Telethon.
 
 ## How it works
 

@@ -1,4 +1,6 @@
 **
 !ringbearer.py
+!ringbearer/
+!ringbearer/**
 !requirements.txt
 !.env.example

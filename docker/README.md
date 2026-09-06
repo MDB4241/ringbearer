@@ -30,7 +30,7 @@ reachable from other machines on the same local network segment, and on all
 versions Docker's published ports bypass ufw/firewalld rules. The Tailscale
 binding avoids both.
 
-The repo-root `.dockerignore` whitelists only the three files the image
+The repo-root `.dockerignore` whitelists only what the image
 needs, so your private state never reaches the Docker daemon as build
 context, on any builder.
 
