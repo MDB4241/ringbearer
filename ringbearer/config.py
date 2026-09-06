@@ -67,6 +67,50 @@ if DELIVERY_CONTEXT not in {"conversation", "one_shot"}:
         "DELIVERY_CONTEXT must be 'conversation' or 'one_shot' "
         f"(got: {DELIVERY_CONTEXT!r})"
     )
+
+
+# The two dials above are the defaults for both routes. Either can be
+# overridden for one route alone: the webhook route is a fixed target you speak
+# at and walk away from, the MCP route is a conversation you address by name,
+# and they do not always want the same treatment. Unset means "use the global",
+# which is what every install written before these keys has, so nothing changes
+# until one is set. Resolution lives in `telegram.dials_for`, and no route can
+# see another route's value.
+def optional_flag(key: str) -> bool | None:
+    """A true/false setting that may be absent.
+
+    Parameters:
+      key (str): the environment variable name.
+
+    Returns: True, False, or None when the key is unset or blank — the caller
+      falls back to the global.
+
+    Raises: exits the process naming the key. An unrecognized value would
+      otherwise read as `false`, which is a wrong answer nobody would see.
+    """
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return None
+    if raw not in {"true", "false"}:
+        sys.exit(f"{key} must be 'true' or 'false' (got: {raw!r})")
+    return raw == "true"
+
+
+def optional_delivery_context(key: str) -> str | None:
+    """A DELIVERY_CONTEXT-shaped setting that may be absent. None when unset or
+    blank; exits on anything that is not `conversation` or `one_shot`."""
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return None
+    if raw not in {"conversation", "one_shot"}:
+        sys.exit(f"{key} must be 'conversation' or 'one_shot' (got: {raw!r})")
+    return raw
+
+
+WEBHOOK_TOPIC_PER_CAPTURE = optional_flag("WEBHOOK_TOPIC_PER_CAPTURE")
+WEBHOOK_DELIVERY_CONTEXT = optional_delivery_context("WEBHOOK_DELIVERY_CONTEXT")
+MCP_TOPIC_PER_CAPTURE = optional_flag("MCP_TOPIC_PER_CAPTURE")
+MCP_DELIVERY_CONTEXT = optional_delivery_context("MCP_DELIVERY_CONTEXT")
 TG_API_ID = os.environ.get("TG_API_ID", "")
 if TG_API_ID and not TG_API_ID.isdigit():
     sys.exit(f"TG_API_ID in .env is not a number — edit {STATE_DIR / '.env'}")

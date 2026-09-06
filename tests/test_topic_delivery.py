@@ -1,6 +1,10 @@
 import asyncio
+import os
+import subprocess
+import sys
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -9,6 +13,19 @@ from telethon.tl.types import MessageActionTopicCreate, UpdateMessageID
 
 from ringbearer import config, telegram
 from ringbearer.route import mcp as route_mcp
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+# Every name that decides a dial, global or per route. Cleared from the
+# environment before a subprocess reads them, so the checkout's own .env-less
+# environment cannot colour the result.
+DIAL_KEYS = (
+    "NEW_TOPIC_PER_CAPTURE",
+    "DELIVERY_CONTEXT",
+    "MCP_TOPIC_PER_CAPTURE",
+    "MCP_DELIVERY_CONTEXT",
+    "WEBHOOK_TOPIC_PER_CAPTURE",
+    "WEBHOOK_DELIVERY_CONTEXT",
+)
 
 
 class FakeTelegramClient:
@@ -474,6 +491,223 @@ class DurableLoggingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertFalse(rows[0]["forwarded"])
         self.assertIn("boom", rows[0]["error"])
+
+
+class RouteDialsTests(unittest.IsolatedAsyncioTestCase):
+    """C65 / A13: each route delivers on its own dials, and setting one
+    route's dials never moves the other's.
+
+    The globals are pinned to the opposite of whatever the route under test
+    wants, so a route that quietly read a global instead of its own override
+    would fail every case rather than pass by coincidence.
+    """
+
+    OTHER = {"conversation": "one_shot", "one_shot": "conversation"}
+
+    async def sent_through(self, source, **dials):
+        """Relay one capture through `source` with these dial values pinned.
+
+        Parameters:
+          source (str): "mcp" or "webhook".
+          dials: config names to patch (globals and per-route overrides).
+
+        Returns: the FakeTelegramClient, holding the topic requests and the
+          message Telegram was asked to send.
+        """
+        client = FakeTelegramClient(topic_id=77)
+        with (
+            routing(object()),
+            patch.object(telegram, "tg_client", client),
+            patch.multiple(
+                config, TELEGRAM_ENABLED=True, RING_PREFIX="mic: ", **dials
+            ),
+            patch.object(telegram, "log_capture", lambda row: None),
+            patch("builtins.print"),
+        ):
+            await telegram.relay("hello", "assistant", source=source)
+        return client
+
+    def assert_saw(self, client, *, topic, context):
+        """Assert the send matches one route's dials, both knobs at once."""
+        if topic:
+            self.assertEqual(len(client.requests), 1)
+            self.assertEqual(client.sent[0][2]["reply_to"], 77)
+        else:
+            self.assertEqual(client.requests, [])
+            self.assertIsNone(client.sent[0][2]["reply_to"])
+        text = client.sent[0][1]
+        if context == "conversation":
+            self.assertEqual(text, "mic: hello")
+        else:
+            self.assertTrue(text.startswith("mic: [RING CAPTURE: ONE-SHOT]"))
+            self.assertTrue(text.endswith("Transcript:\nhello"))
+
+    async def test_each_route_delivers_on_its_own_dials(self):
+        for source, other in (("webhook", "mcp"), ("mcp", "webhook")):
+            for topic in (True, False):
+                for context in ("conversation", "one_shot"):
+                    with self.subTest(source=source, topic=topic, context=context):
+                        # This route wants (topic, context); the globals and
+                        # the other route are pinned to the opposite of both.
+                        dials = {
+                            "NEW_TOPIC_PER_CAPTURE": not topic,
+                            "DELIVERY_CONTEXT": self.OTHER[context],
+                            f"{source.upper()}_TOPIC_PER_CAPTURE": topic,
+                            f"{source.upper()}_DELIVERY_CONTEXT": context,
+                            f"{other.upper()}_TOPIC_PER_CAPTURE": not topic,
+                            f"{other.upper()}_DELIVERY_CONTEXT": self.OTHER[context],
+                        }
+                        self.assert_saw(
+                            await self.sent_through(source, **dials),
+                            topic=topic,
+                            context=context,
+                        )
+                        # Same configuration, the other door: it must still
+                        # deliver on its own values (A13).
+                        self.assert_saw(
+                            await self.sent_through(other, **dials),
+                            topic=not topic,
+                            context=self.OTHER[context],
+                        )
+
+    async def test_an_unset_override_falls_back_to_the_global(self):
+        for source, other in (("webhook", "mcp"), ("mcp", "webhook")):
+            for topic in (True, False):
+                for context in ("conversation", "one_shot"):
+                    with self.subTest(source=source, topic=topic, context=context):
+                        # Neither of this route's keys is set; the other route
+                        # holds the opposite of both, and must not leak.
+                        dials = {
+                            "NEW_TOPIC_PER_CAPTURE": topic,
+                            "DELIVERY_CONTEXT": context,
+                            f"{source.upper()}_TOPIC_PER_CAPTURE": None,
+                            f"{source.upper()}_DELIVERY_CONTEXT": None,
+                            f"{other.upper()}_TOPIC_PER_CAPTURE": not topic,
+                            f"{other.upper()}_DELIVERY_CONTEXT": self.OTHER[context],
+                        }
+                        with patch.multiple(config, **dials):
+                            self.assertEqual(
+                                telegram.dials_for(source),
+                                telegram.Dials(topic, context),
+                            )
+                        self.assert_saw(
+                            await self.sent_through(source, **dials),
+                            topic=topic,
+                            context=context,
+                        )
+
+    async def test_one_key_overridden_leaves_the_other_on_the_global(self):
+        """The two dials are independent: overriding the topic setting for a
+        route must not drag its delivery context along."""
+        dials = {
+            "NEW_TOPIC_PER_CAPTURE": False,
+            "DELIVERY_CONTEXT": "one_shot",
+            "WEBHOOK_TOPIC_PER_CAPTURE": True,
+            "WEBHOOK_DELIVERY_CONTEXT": None,
+            "MCP_TOPIC_PER_CAPTURE": None,
+            "MCP_DELIVERY_CONTEXT": None,
+        }
+        self.assert_saw(
+            await self.sent_through("webhook", **dials), topic=True, context="one_shot"
+        )
+        self.assert_saw(
+            await self.sent_through("mcp", **dials), topic=False, context="one_shot"
+        )
+
+    async def test_a_direct_deliver_outside_a_relay_uses_the_globals(self):
+        """`deliver` is called on its own by tests and by nothing else; with
+        no relay to set the dials it reads the install-wide pair."""
+        client = FakeTelegramClient(topic_id=77)
+        with (
+            routing(object()),
+            patch.object(telegram, "tg_client", client),
+            patch.multiple(
+                config,
+                TELEGRAM_ENABLED=True,
+                RING_PREFIX="mic: ",
+                NEW_TOPIC_PER_CAPTURE=True,
+                DELIVERY_CONTEXT="conversation",
+                WEBHOOK_TOPIC_PER_CAPTURE=False,
+                MCP_TOPIC_PER_CAPTURE=False,
+            ),
+        ):
+            self.assertEqual(telegram.current_dials(), telegram.Dials(True, "conversation"))
+            await telegram.deliver("hello")
+        self.assert_saw(client, topic=True, context="conversation")
+
+    def test_the_delivery_mode_label_can_speak_for_one_route(self):
+        with patch.multiple(
+            config,
+            NEW_TOPIC_PER_CAPTURE=False,
+            WEBHOOK_TOPIC_PER_CAPTURE=True,
+            MCP_TOPIC_PER_CAPTURE=None,
+        ):
+            self.assertEqual(
+                telegram.delivery_mode_label(telegram.dials_for("webhook")),
+                "new topic per capture",
+            )
+            self.assertEqual(
+                telegram.delivery_mode_label(telegram.dials_for("mcp")),
+                "current Telegram conversation",
+            )
+
+
+class DialValidationTests(unittest.TestCase):
+    """The per-route keys are read and checked at import, like the globals
+    they override: a value that is neither of the two legal ones stops the
+    process while someone is still looking at a terminal."""
+
+    def _dials(self, **env_overrides):
+        env = {k: v for k, v in os.environ.items() if k not in DIAL_KEYS}
+        env["TELEGRAM_ENABLED"] = "false"
+        env.update(env_overrides)
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from ringbearer import telegram;"
+                "print(telegram.dials_for('mcp'));"
+                "print(telegram.dials_for('webhook'))",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_a_bad_flag_value_exits_naming_the_key(self):
+        result = self._dials(WEBHOOK_TOPIC_PER_CAPTURE="yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("WEBHOOK_TOPIC_PER_CAPTURE", result.stderr)
+        self.assertIn("'true' or 'false'", result.stderr)
+
+    def test_a_bad_context_value_exits_naming_the_key(self):
+        result = self._dials(MCP_DELIVERY_CONTEXT="chatty")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MCP_DELIVERY_CONTEXT", result.stderr)
+        self.assertIn("'conversation' or 'one_shot'", result.stderr)
+
+    def test_the_environment_reaches_the_right_route(self):
+        result = self._dials(
+            MCP_TOPIC_PER_CAPTURE="true", WEBHOOK_DELIVERY_CONTEXT="one_shot"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        mcp_dials, webhook_dials = result.stdout.strip().splitlines()
+        self.assertEqual(
+            mcp_dials, "Dials(topic_per_capture=True, delivery_context='conversation')"
+        )
+        self.assertEqual(
+            webhook_dials,
+            "Dials(topic_per_capture=False, delivery_context='one_shot')",
+        )
+
+    def test_unset_keys_leave_both_routes_on_the_globals(self):
+        result = self._dials(NEW_TOPIC_PER_CAPTURE="true", DELIVERY_CONTEXT="one_shot")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip().splitlines(),
+            ["Dials(topic_per_capture=True, delivery_context='one_shot')"] * 2,
+        )
 
 
 if __name__ == "__main__":

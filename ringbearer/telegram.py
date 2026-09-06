@@ -2,7 +2,8 @@
 
 The client itself, the health view that decides what /healthz says, the
 supervisor that keeps the connection alive across outages, and the delivery
-path a capture takes from the tool handler into the assistant's DM.
+path every capture takes into the assistant's DM — `relay`, which both routes
+call and neither duplicates.
 
 `tg_client`, `recheck_now`, `tg_health` and `assistant_entities` are rebound
 at runtime — by lifespan at startup, and by tests. Everything in this module
@@ -15,7 +16,9 @@ import json
 import random
 import time
 from contextlib import suppress
+from contextvars import ContextVar
 from datetime import datetime
+from typing import NamedTuple
 
 from . import config
 
@@ -356,20 +359,84 @@ def log_capture(row: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+class Dials(NamedTuple):
+    """The two delivery settings, resolved for one route.
+
+    They travel together because they are asked together on every send: does
+    this capture open its own Telegram topic, and does the assistant receive
+    it as conversation or as a one-shot instruction.
+    """
+
+    topic_per_capture: bool
+    delivery_context: str
+
+
+# Which config names hold each route's override. A route absent from this map
+# (or a caller that names none) gets the globals, unchanged.
+ROUTE_DIAL_KEYS = {
+    "mcp": ("MCP_TOPIC_PER_CAPTURE", "MCP_DELIVERY_CONTEXT"),
+    "webhook": ("WEBHOOK_TOPIC_PER_CAPTURE", "WEBHOOK_DELIVERY_CONTEXT"),
+}
+
+
+def global_dials() -> Dials:
+    """The install-wide settings both routes default to."""
+    return Dials(config.NEW_TOPIC_PER_CAPTURE, config.DELIVERY_CONTEXT)
+
+
+def dials_for(source: str) -> Dials:
+    """One route's settings: its own override wherever it set one, the global
+    everywhere else.
+
+    Parameters:
+      source (str): the route name — "mcp", "webhook", or anything else,
+        which resolves to the globals alone.
+
+    Returns: the resolved Dials. Read through `config` on every call, never
+      cached: tests rebind those names, and a route must never be able to
+      observe the other route's override (A13).
+    """
+    topic_key, context_key = ROUTE_DIAL_KEYS.get(source, (None, None))
+    topic = getattr(config, topic_key) if topic_key else None
+    context = getattr(config, context_key) if context_key else None
+    fallback = global_dials()
+    return Dials(
+        fallback.topic_per_capture if topic is None else topic,
+        fallback.delivery_context if context is None else context,
+    )
+
+
+# The dials in force for the capture this task is carrying. `relay` sets them
+# once, for the length of one capture, and the delivery path below reads them
+# from here — so `deliver` keeps the call shape it has always had and no route
+# has to thread an argument through. A ContextVar and not a module global
+# because two captures can be in flight at once (one door does not wait for
+# the other), and a task inherits the context it was created in.
+_dials: ContextVar[Dials | None] = ContextVar("ringbearer_dials", default=None)
+
+
+def current_dials() -> Dials:
+    """The dials for the capture in flight, or the globals outside a relay
+    (a direct `deliver` call, the setup banner, a test)."""
+    return _dials.get() or global_dials()
+
+
 def topic_title(message: str) -> str:
     normalized = " ".join(message.split())
     return normalized[:80] or "Ring capture"
 
 
-def delivery_mode_label() -> str:
-    if config.NEW_TOPIC_PER_CAPTURE:
+def delivery_mode_label(dials: Dials | None = None) -> str:
+    """How this route delivers, in words, for the phone cards and the startup
+    banner. No argument means the globals."""
+    if (dials or current_dials()).topic_per_capture:
         return "new topic per capture"
     return "current Telegram conversation"
 
 
-def format_delivery_message(message: str) -> str:
+def format_delivery_message(message: str, dials: Dials | None = None) -> str:
     """Add recipient-side context without changing the captured transcript."""
-    if config.DELIVERY_CONTEXT == "conversation":
+    if (dials or current_dials()).delivery_context == "conversation":
         return f"{config.RING_PREFIX}{message}"
     return (
         f"{config.RING_PREFIX}[RING CAPTURE: ONE-SHOT]\n"
@@ -425,11 +492,14 @@ async def create_topic(title: str, peer) -> int:
     return scanned
 
 
-async def deliver(message: str, assistant: str | None = None) -> bool:
+async def deliver(message: str, assistant: str | None = None, *, dials: Dials | None = None) -> bool:
     """Post into the target assistant's DM as the user. Returns True if
-    actually sent. `assistant` is a roster name; None means the default."""
+    actually sent. `assistant` is a roster name; None means the default.
+    `dials` overrides the ones in force — normally `relay` has already set
+    the calling route's, and there is nothing to pass."""
     if not (config.TELEGRAM_ENABLED and tg_client is not None):
         return False
+    dials = dials or current_dials()
     name = assistant or config.DEFAULT_ASSISTANT
     target = assistant_entities.get(name)
     if target is None:
@@ -439,7 +509,7 @@ async def deliver(message: str, assistant: str | None = None) -> bool:
     # (The capture is still written to captures.jsonl by the caller.)
     reply_to = (
         await create_topic(topic_title(message), target)
-        if config.NEW_TOPIC_PER_CAPTURE
+        if dials.topic_per_capture
         else None
     )
     # parse_mode=None: the transcript is a promise ("verbatim and in
@@ -448,7 +518,7 @@ async def deliver(message: str, assistant: str | None = None) -> bool:
     # send into that topic; None is Telethon's default (no threading).
     await tg_client.send_message(
         target,
-        format_delivery_message(message),
+        format_delivery_message(message, dials),
         parse_mode=None,
         reply_to=reply_to,
     )
@@ -456,89 +526,167 @@ async def deliver(message: str, assistant: str | None = None) -> bool:
     return True
 
 
-async def relay(message: str, assistant: str) -> str:
-    """The tool body, shared by both registered signatures."""
-    # Server-side validation regardless of the schema enum: the schema is
-    # advisory to a cloud LLM. An off-roster name fails loud with the valid
-    # list — the user's words are never silently re-routed to a chat they
-    # didn't address — and the transcript is still logged.
-    if assistant not in config.ASSISTANT_ROSTER:
-        log_capture({
-            "received_at": datetime.now().astimezone().isoformat(),
-            "source": "mcp",
-            "transcription": message,
-            "assistant": assistant,
-            "forwarded": False,
-            "error": f"unknown assistant {assistant!r}",
-        })
-        print(f"[mcp] {config.TOOL_NAME}: unknown assistant {assistant!r}", flush=True)
-        return (
-            f"Unknown assistant {assistant!r} — valid: "
-            f"{', '.join(config.ASSISTANT_ROSTER)}. Not delivered; retry with one of "
-            "those, or omit the argument for the default."
-        )
-    route = f" -> {assistant}" if assistant != config.DEFAULT_ASSISTANT else ""
+class Reply(str):
+    """What `relay` hands back: the sentence the MCP tool returns, with the
+    capture row attached as `.row`.
 
-    # Probe guard: a DRYRUN-prefixed message exercises the whole path (auth,
-    # MCP dispatch, routing, logging) without putting anything in the real
-    # assistant DM. Live probes are real messages to a real assistant —
-    # never send them casually.
-    if message.startswith(config.DRY_RUN_PREFIX):
-        log_capture({
-            "received_at": datetime.now().astimezone().isoformat(),
-            "source": "mcp",
-            "transcription": message,
-            "assistant": assistant,
-            "forwarded": False,
-            "dry_run": True,
-        })
-        print(f"[mcp] {config.TOOL_NAME}{route}: DRY RUN — not delivered", flush=True)
-        return "Dry run: received, not delivered to Telegram."
+    A str subclass because the tool's return value IS that sentence and has to
+    stay a plain string on the wire. The webhook route answers the phone in
+    JSON instead and builds that answer from the row — the same row that
+    reached captures.jsonl, so what the phone is told and what the disk
+    records can never disagree.
+    """
 
-    started = time.monotonic()
+    row: dict
 
-    def finish(sent: bool, err: str | None) -> None:
-        send_ms = round((time.monotonic() - started) * 1000)
-        print(f"[mcp] {config.TOOL_NAME}{route}: telegram {send_ms}ms" + (f" ERROR {err}" if err else ""), flush=True)
+    def __new__(cls, text: str, row: dict) -> "Reply":
+        reply = super().__new__(cls, text)
+        reply.row = row
+        return reply
+
+
+async def relay(
+    message: str | None,
+    assistant: str,
+    *,
+    source: str = "mcp",
+    extra: dict | None = None,
+    dials: Dials | None = None,
+    reason: str | None = None,
+) -> Reply:
+    """Deliver one capture and log it, whichever door it arrived through.
+
+    Both routes end here — the MCP tool body and the webhook route — because
+    everything that differs between them is data, not code.
+
+    Parameters:
+      message (str | None): the transcript, verbatim. None only alongside
+        `reason`: a capture with nothing to say still gets a row.
+      assistant (str): a roster name. An off-roster name is refused loudly and
+        still logged; the user's words are never silently re-routed.
+      source (str): which door — "mcp" or "webhook". Names the row's `source`,
+        picks the log line's shape, and selects the dials.
+      extra (dict | None): row fields only one door has (the webhook's
+        trigger, audio size, engine timings, test and duplicate flags, and its
+        own `received_at`, which predates the transcription this row waited
+        on). Merged onto the row last.
+      dials (Dials | None): the delivery settings to use; None resolves them
+        from `source`. Set for the length of the call, so `deliver` and
+        `format_delivery_message` need no argument.
+      reason (str | None): set when the caller has already decided not to
+        deliver — a test event, a duplicate, a transcription that failed.
+        The row is written with the reason and nothing is sent.
+
+    Returns: a Reply — the sentence for the MCP tool, `.row` for the webhook.
+    """
+    extra = extra or {}
+    dial_token = _dials.set(dials or dials_for(source))
+    # The operator line's prefix. The MCP door names the tool it answered (and
+    # the assistant, when it is not the default); the webhook door names the
+    # gesture that fired it, which is the only routing fact it has.
+    if source == "webhook":
+        label = routed = f"[webhook] {extra.get('trigger') or 'no-trigger'}"
+    else:
+        label = f"[mcp] {config.TOOL_NAME}"
+        routed = label + (f" -> {assistant}" if assistant != config.DEFAULT_ASSISTANT else "")
+
+    def record(**outcome) -> dict:
+        """Write this capture's row and return it. The row is the record: the
+        reply the caller sends back is a view of it, never a second opinion."""
         row = {
             "received_at": datetime.now().astimezone().isoformat(),
-            "source": "mcp",
+            "source": source,
             "transcription": message,
             "assistant": assistant,
-            "forwarded": sent,
-            "telegram_ms": send_ms,
+            **outcome,
+            **extra,
         }
-        if err:
-            row["error"] = err
         log_capture(row)
+        return row
 
-    err = None
     try:
-        # Bounded: a Telegram stall must not hold the transcript hostage —
-        # timeout lands in the except and the capture row still gets written.
-        sent = await asyncio.wait_for(deliver(message, assistant), timeout=30)
-    except asyncio.CancelledError as e:
-        if asyncio.current_task().cancelling():
-            # Cancellation (request dropped, server shutting down) is
-            # BaseException, so the clause below never sees it — log the only
-            # copy of the transcript first, then propagate it bare.
-            finish(False, repr(e))
-            raise
-        # A cancelled future, not a cancelled request: Telethon cancels the
-        # send's future when it tears the connection down mid-send. To the ring
-        # that is a failed delivery like any other — logged, reported, and the
-        # supervisor nudged. Same class as connection_supervisor's handler.
-        sent, err = False, "ConnectionError: Telegram tore the connection down mid-send"
-        request_recheck()
-    except Exception as e:  # the transcript is the only copy — log it no matter what
-        sent, err = False, repr(e)
-        # Evidence about the link, arriving between polls: let the supervisor
-        # confirm or clear it now instead of at the next tick.
-        request_recheck()
-    finish(sent, err)
-    display = config.ASSISTANT_NAME if assistant == config.DEFAULT_ASSISTANT else assistant
-    if sent:
-        return f"Delivered. {display} will reply in Telegram."
-    if err:
-        return f"Logged locally, but Telegram delivery failed: {err}"
-    return "Received and logged. (Telegram delivery not yet enabled.)"
+        # Server-side validation regardless of the schema enum: the schema is
+        # advisory to a cloud LLM. An off-roster name fails loud with the valid
+        # list — the user's words are never silently re-routed to a chat they
+        # didn't address — and the transcript is still logged.
+        if assistant not in config.ASSISTANT_ROSTER:
+            row = record(forwarded=False, error=f"unknown assistant {assistant!r}")
+            print(f"{label}: unknown assistant {assistant!r}", flush=True)
+            return Reply(
+                f"Unknown assistant {assistant!r} — valid: "
+                f"{', '.join(config.ASSISTANT_ROSTER)}. Not delivered; retry with one of "
+                "those, or omit the argument for the default.",
+                row,
+            )
+
+        # The route decided this one is not going anywhere (a test event, a
+        # duplicate, audio the engine could not read). Still a fact worth
+        # keeping, and still an answer worth giving.
+        if reason is not None:
+            row = record(forwarded=False, reason=reason)
+            err = row.get("error")
+            print(
+                f"{routed}: not delivered ({reason})" + (f" ERROR {err}" if err else ""),
+                flush=True,
+            )
+            return Reply(f"Received and logged. Not delivered: {reason}.", row)
+
+        # Probe guard: a DRYRUN-prefixed message exercises the whole path (auth,
+        # dispatch, routing, logging) without putting anything in the real
+        # assistant DM. Live probes are real messages to a real assistant —
+        # never send them casually.
+        if message.startswith(config.DRY_RUN_PREFIX):
+            row = record(forwarded=False, dry_run=True)
+            print(f"{routed}: DRY RUN — not delivered", flush=True)
+            return Reply("Dry run: received, not delivered to Telegram.", row)
+
+        started = time.monotonic()
+
+        def finish(sent: bool, err: str | None) -> dict:
+            send_ms = round((time.monotonic() - started) * 1000)
+            timings = "".join(
+                f" {name} {ms}ms"
+                for name, ms in (
+                    ("transcribe", extra.get("transcribe_ms")),
+                    ("telegram", send_ms),
+                )
+                if ms is not None
+            )
+            print(f"{routed}:{timings}" + (f" ERROR {err}" if err else ""), flush=True)
+            outcome = {"forwarded": sent, "telegram_ms": send_ms}
+            if err:
+                outcome["error"] = err
+            return record(**outcome)
+
+        err = None
+        try:
+            # Bounded: a Telegram stall must not hold the transcript hostage —
+            # timeout lands in the except and the capture row still gets written.
+            sent = await asyncio.wait_for(deliver(message, assistant), timeout=30)
+        except asyncio.CancelledError as e:
+            if asyncio.current_task().cancelling():
+                # Cancellation (request dropped, server shutting down) is
+                # BaseException, so the clause below never sees it — log the only
+                # copy of the transcript first, then propagate it bare.
+                finish(False, repr(e))
+                raise
+            # A cancelled future, not a cancelled request: Telethon cancels the
+            # send's future when it tears the connection down mid-send. To the ring
+            # that is a failed delivery like any other — logged, reported, and the
+            # supervisor nudged. Same class as connection_supervisor's handler.
+            sent, err = False, "ConnectionError: Telegram tore the connection down mid-send"
+            request_recheck()
+        except Exception as e:  # the transcript is the only copy — log it no matter what
+            sent, err = False, repr(e)
+            # Evidence about the link, arriving between polls: let the supervisor
+            # confirm or clear it now instead of at the next tick.
+            request_recheck()
+        row = finish(sent, err)
+        display = config.ASSISTANT_NAME if assistant == config.DEFAULT_ASSISTANT else assistant
+        if sent:
+            return Reply(f"Delivered. {display} will reply in Telegram.", row)
+        if err:
+            return Reply(f"Logged locally, but Telegram delivery failed: {err}", row)
+        return Reply("Received and logged. (Telegram delivery not yet enabled.)", row)
+    finally:
+        _dials.reset(dial_token)
