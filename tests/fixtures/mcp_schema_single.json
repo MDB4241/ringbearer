@@ -1,0 +1,49 @@
+{
+  "healthz": {
+    "keys": [
+      "connection",
+      "ok",
+      "telegram"
+    ],
+    "status": 200
+  },
+  "prompts": [
+    {
+      "arguments": [],
+      "description": "Standing instruction for handling ring voice captures.",
+      "name": "ring_routing"
+    }
+  ],
+  "tools": [
+    {
+      "description": "Relay the user's spoken message to assistant, their personal assistant. It handles ALL requests (reminders, questions, tasks, notes, anything) and replies to the user directly in Telegram. This is the only action available: for EVERY user message, call this tool exactly once with the user's words verbatim and in full. Never paraphrase, never summarize, never answer the user yourself, and never skip the call \u2014 even for greetings, tests, or unclear speech.",
+      "input_schema": {
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "title": "send_to_assistantArguments",
+        "type": "object"
+      },
+      "name": "send_to_assistant",
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "send_to_assistantOutput",
+        "type": "object"
+      }
+    }
+  ]
+}
