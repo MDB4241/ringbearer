@@ -4,3 +4,4 @@
 !ringbearer/**
 !requirements.txt
 !.env.example
+**/__pycache__
