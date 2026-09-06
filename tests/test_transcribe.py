@@ -22,6 +22,10 @@ from fastapi import Response
 from ringbearer import config, transcribe
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+# 7.6 seconds of speech in the shape the phone sends — AAC-LC in M4A, mono,
+# 16 kHz. What it says, which is what the real-engine test below reads back:
+# "Remind me to take the trash out tonight, and add milk to the grocery list.
+#  Also, what time is my dentist appointment on Thursday?"
 CLIP = FIXTURES / "ring_fixture.m4a"
 
 
@@ -196,6 +200,11 @@ class RealEngineTests(unittest.TestCase):
     Opt-in because it downloads a model and takes seconds, not milliseconds.
     It is also the C77 probe: the weights land under the state dir, and a
     second construction reads them with no network at all.
+
+    The four words asserted below — trash, milk, dentist, Thursday — are the
+    load-bearing nouns of the two spoken sentences (see CLIP at the top of
+    this file). Four, and not the whole transcript, because punctuation and
+    casing are the model's business and change with the model.
     """
 
     def test_the_real_engine_reads_the_fixture_clip(self):
