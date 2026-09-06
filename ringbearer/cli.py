@@ -126,7 +126,7 @@ def setup() -> None:
                 continue
             return raw
 
-    print(bold("ringbearer setup") + " — five questions, about three minutes.\n")
+    print(bold("ringbearer setup") + " — six questions, about three minutes.\n")
 
     token = secrets.token_urlsafe(32)
     print(cyan("1. Bridge token") + " — generated for you:")
@@ -173,26 +173,67 @@ def setup() -> None:
                 print(dim("      `ifconfig` shows what's available)"))
         port = ask("     BIND_PORT [8787]: ", default="8787", numeric=True)
 
+    # The one question that decides which doors this install uses. One
+    # assistant needs only the webhook: the ring posts straight here and the
+    # app's cloud agent is not in the path at all. Several assistants need the
+    # MCP route, because routing by spoken name is what that route is for.
+    print("\n" + cyan("6. Do you have more than one assistant?"))
+    print("   One — the ring posts straight to it over the webhook: no cloud")
+    print("   agent in the middle, nothing to address by name.")
+    print("   Several — the MCP route adds routing by spoken name ('ask plutus")
+    print("   to check my portfolio'), through the app's cloud agent.")
+    multiple = ask("     More than one assistant? [y/N]: ", default="n").lower()
+    extras: list[tuple[str, str]] = []
+    if multiple.startswith("y"):
+        print("\n   Name each extra assistant and the chat it lives in.")
+        print("   Names are short lowercase tokens — you say them out loud.")
+        while True:
+            extra = ask("     Assistant name (blank when done): ", default="")
+            if not extra:
+                break
+            try:
+                config.parse_assistants(f"{extra}:placeholder")
+            except ValueError as e:
+                print(dim(f"     ({e})"))
+                continue
+            if extra == config.slug(name) or any(extra == n for n, _ in extras):
+                print(dim(f"     ({extra} is already taken)"))
+                continue
+            extras.append(
+                (extra, ask(f"     Chat for {extra} (@botusername or chat id): "))
+            )
+    routes = ("webhook", "mcp") if extras else ("webhook",)
+
     # Restricted from birth: no umask-default window with the token inside.
     env_path.touch(mode=0o600)
     env_path.write_text(
         f"BRIDGE_TOKEN={token}\n"
         "TELEGRAM_ENABLED=true\n"
+        f"ROUTES={','.join(routes)}\n"
         "NEW_TOPIC_PER_CAPTURE=false\n"
         "DELIVERY_CONTEXT=conversation\n"
         f"ASSISTANT_CHAT={chat}\n"
         f"ASSISTANT_NAME={name}\n"
-        f"TG_API_ID={api_id}\n"
+        + (
+            f"ASSISTANTS={','.join(f'{n}:{c}' for n, c in extras)}\n"
+            if extras
+            else ""
+        )
+        + f"TG_API_ID={api_id}\n"
         f"TG_API_HASH={api_hash}\n"
         f"BIND_HOST={host}\n"
         f"BIND_PORT={port}\n"
         "SESSION_NAME=ringbearer\n"
         "# RING_PREFIX=\U0001f3a4   # prefix on relayed messages\n"
         "# MCP_MOUNT=/ringbearer   # MCP endpoint becomes <MCP_MOUNT>/mcp\n"
+        "# WEBHOOK_TOPIC_PER_CAPTURE=false     # per-route override of NEW_TOPIC_PER_CAPTURE\n"
+        "# WEBHOOK_DELIVERY_CONTEXT=one_shot   # per-route override of DELIVERY_CONTEXT\n"
+        "# MCP_TOPIC_PER_CAPTURE=false         # the same two knobs, for the MCP route\n"
+        "# MCP_DELIVERY_CONTEXT=conversation\n"
     )
     env_path.chmod(0o600)
     print(green(f"\nWrote {env_path} (mode 600)."))
-    print_phone_settings(host, port, token)
+    print_phone_settings(host, port, token, routes)
 
 
 def required_missing() -> list[str]:
@@ -225,20 +266,65 @@ def check_bindable(host: str) -> None:
         )
 
 
-def print_phone_settings(host: str, port: str, token: str) -> None:
-    print(bold("\nPebble app settings") + " (Index settings → MCP servers)")
-    print(dim("  — reprint any time with `python ringbearer.py setup`"))
+def print_webhook_card(host: str, port: str, token: str) -> None:
+    """The fast door's phone settings: a recording gesture, routed AND saved.
+
+    Both halves matter and the app does not say so. "Webhook only" is a
+    routing choice; the URL and headers live in a separate per-gesture webhook
+    config that fires under every destination except "Nothing".
+    """
+    print(bold("\nPebble app settings — webhook route") + " (Index settings → the button switchboard)")
+    print("  " + bold("Two halves, both required:"))
+    print("   1. Route a recording gesture — Hold & Talk, or Double click & hold —")
+    print('      to "Webhook only".')
+    print("   2. Open that same gesture's Webhook settings and save the URL and")
+    print("      header below. The route alone sends nothing, and a saved webhook")
+    print("      on a gesture routed somewhere else delivers twice.")
+    print(f"  URL:     {yellow(f'http://{host}:{port}{config.MCP_MOUNT}/webhook')}")
+    print(f"  Header:  {yellow(f'Authorization: Bearer {token}')}")
+    print('  Payload: "Recording only" (the app\'s default) sends the audio and this')
+    print('           bridge makes the text. "Both" or "Transcription only" sends the')
+    print("           phone's own transcript, and the bridge relays it as-is.")
+    print(f"  Delivery: {telegram.delivery_mode_label(telegram.dials_for('webhook'))}")
+    print("  First check: " + bold("Send test event") + " in those webhook settings — the bridge")
+    print("           answers 200 and forwards nothing.")
+    print('  On any gesture you leave on MCP sandbox, turn "Also send to webhook" ' + bold("off") + ".")
+
+
+def print_mcp_card(host: str, port: str, token: str) -> None:
+    """The named-routing door's phone settings: Index settings → MCP servers."""
+    print(bold("\nPebble app settings — MCP route") + " (Index settings → MCP servers)")
+    print(f"  URL:     {yellow(f'http://{host}:{port}{config.MCP_MOUNT}/mcp')}   (transport: Streamable)")
+    print(f"  Header:  {yellow(f'Authorization: Bearer {token}')}")
+    print(f"  Delivery: {telegram.delivery_mode_label(telegram.dials_for('mcp'))}")
+    print("  Name:    anything " + bold("WITHOUT spaces") + " (a space breaks tool dispatch)")
+    print("  Group:   model type Default, then Secondary Mode → MCP Sandbox → pick the group.")
+    print("  Also send to webhook: " + bold("off") + " — a saved webhook fires on every")
+    print('           destination except "Nothing", so one left here delivers twice.')
+
+
+def print_phone_settings(host: str, port: str, token: str, routes=None) -> None:
+    """Print the phone card for each configured route.
+
+    Parameters:
+      host, port, token: what the phone dials, and what it must send.
+      routes (tuple[str, ...] | None): which cards to print. None means the
+        configured ROUTES; `setup` passes the answer it just collected,
+        because config read the environment before that .env existed.
+    """
+    routes = config.ROUTES if routes is None else routes
     if host == "0.0.0.0":
         # The listener answers on every interface, but the phone needs a real
         # address to dial — in Docker, the address the port is published on.
         host = "<this-machine's-address>"
-        print(dim("  (0.0.0.0 is the listener, not a dialable address — in Docker, use"))
+        print(dim("\n  (0.0.0.0 is the listener, not a dialable address — in Docker, use"))
         print(dim("   the host address you published the port on)"))
-    print(f"  URL:     {yellow(f'http://{host}:{port}{config.MCP_MOUNT}/mcp')}   (transport: Streamable)")
-    print(f"  Header:  {yellow(f'Authorization: Bearer {token}')}")
-    print(f"  Delivery: {telegram.delivery_mode_label()}")
-    print("  Name:    anything " + bold("WITHOUT spaces") + " (a space breaks tool dispatch)")
-    print("  Group:   model type Default, then Secondary Mode → MCP Sandbox → pick the group.")
+    for route in routes:
+        if route == "webhook":
+            print_webhook_card(host, port, token)
+        else:
+            print_mcp_card(host, port, token)
+    print(dim("  — reprint any time with `python ringbearer.py setup`"))
 
 
 def incomplete_env_exit(missing: list[str]) -> None:
@@ -260,8 +346,10 @@ def run() -> None:
     check_bindable(config.BIND_HOST)
     import uvicorn
 
-    print(bold(f"ringbearer → http://{config.BIND_HOST}:{config.BIND_PORT}{config.MCP_MOUNT}/mcp"))
-    print(f"Telegram delivery: {telegram.delivery_mode_label()}")
+    # The headline is the listener; the exact endpoint of each door lives on
+    # that door's card below, so no URL is printed twice.
+    print(bold(f"ringbearer → http://{config.BIND_HOST}:{config.BIND_PORT}"))
+    print("Routes: " + ", ".join(config.ROUTES))
     if len(config.ASSISTANT_ROSTER) > 1:
         print("Assistants: " + ", ".join(
             f"{n} (default)" if n == config.DEFAULT_ASSISTANT else n
@@ -275,16 +363,96 @@ def run() -> None:
             ),
             flush=True,
         )
+    print_phone_settings(config.BIND_HOST, str(config.BIND_PORT), config.BRIDGE_TOKEN)
+    print(flush=True)
     uvicorn.run(app, host=config.BIND_HOST, port=config.BIND_PORT)
 
 
-def probe(live: bool = False, assistant: str | None = None) -> None:
-    """Client-side diagnostic: connect exactly like the phone would —
-    initialize, list tools, call the send tool. Dry run by default; the
-    assistant DM is a live channel and --live sends a real message it will
-    act on. --assistant <name> targets a mapped assistant (see ASSISTANTS),
-    exercising the routing without the ring. BRIDGE_URL overrides the
-    target (e.g. probing a remote install)."""
+def probe_urls() -> tuple[str, str]:
+    """Where to probe: (mcp, webhook).
+
+    BRIDGE_URL has always meant the MCP endpoint, so the webhook URL is
+    derived from the same base rather than asking for a second variable — one
+    install, one address, two doors on it.
+    """
+    base = os.environ.get("BRIDGE_URL", "").strip()
+    if base:
+        root = base[: -len("/mcp")] if base.endswith("/mcp") else base.rstrip("/")
+    else:
+        root = f"http://{config.BIND_HOST or 'localhost'}:{config.BIND_PORT}{config.MCP_MOUNT}"
+    return f"{root}/mcp", f"{root}/webhook"
+
+
+def probe_message(live: bool) -> str:
+    """What a probe says. Dry run unless --live: the DRYRUN prefix is what
+    makes the bridge log the capture and stop, instead of putting a probe in
+    a real assistant's DM (A4)."""
+    text = "bridge probe, no reply needed"
+    return text if live else f"{config.DRY_RUN_PREFIX} {text}"
+
+
+def phone_multipart(transcription: str) -> tuple[bytes, str]:
+    """The app's own body: `transcription`, `recordedAt` (epoch milliseconds)
+    and `client=ring`, in that order, with a UUID boundary.
+
+    No `audio` part — the probe proves the route, the token and the relay, not
+    the transcription engine.
+
+    Returns: (body, the Content-Type value that describes it).
+    """
+    from uuid import uuid4
+
+    boundary = uuid4().hex
+    fields = (
+        ("transcription", transcription),
+        ("recordedAt", str(round(time.time() * 1000))),
+        ("client", "ring"),
+    )
+    body = b"".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+        for name, value in fields
+    ) + f"--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def probe_webhook(url: str, live: bool) -> None:
+    """POST the shape the phone posts, and print what came back.
+
+    The trigger header says `single-click-hold` and not `test-event` on
+    purpose: a test event is answered before the capture ever reaches the
+    relay, so it would prove the URL and the token and nothing past them —
+    and the dry-run guard, the thing that makes this safe to fire at a live
+    install, would never run.
+    """
+    import logging
+
+    import httpx2
+
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
+
+    body, content_type = phone_multipart(probe_message(live))
+    print(f"probing webhook {url}" + (" (LIVE)" if live else " (dry run)"), flush=True)
+    response = httpx2.post(
+        url,
+        content=body,
+        headers={
+            "Content-Type": content_type,
+            "Authorization": f"Bearer {config.BRIDGE_TOKEN}",
+            "X-Index-Trigger": "single-click-hold",
+        },
+        timeout=15,
+    )
+    print(f"result: {response.status_code} {response.text}")
+    if not 200 <= response.status_code < 300:
+        # Anything else is a failure worth an exit code — a 3xx included: the
+        # app follows redirects on a POST and re-sends the whole body, so this
+        # route answering with one would be a bug, not a hop.
+        raise RuntimeError(f"{response.status_code} {response.text.strip()[:200]}")
+
+
+def probe_mcp(url: str, live: bool, assistant: str | None) -> None:
+    """Connect exactly like the phone would — initialize, list tools, call the
+    send tool."""
     import logging
 
     import httpx2
@@ -293,20 +461,16 @@ def probe(live: bool = False, assistant: str | None = None) -> None:
 
     logging.getLogger("httpx2").setLevel(logging.WARNING)
 
-    url = os.environ.get("BRIDGE_URL") or (
-        f"http://{config.BIND_HOST or 'localhost'}:{config.BIND_PORT}{config.MCP_MOUNT}/mcp"
-    )
-    text = "bridge probe, no reply needed"
-    message = text if live else f"{config.DRY_RUN_PREFIX} {text}"
     print(
-        f"probing {url}"
+        f"probing mcp {url}"
         + (" (LIVE)" if live else " (dry run)")
-        + (f" -> assistant {assistant}" if assistant else "")
+        + (f" -> assistant {assistant}" if assistant else ""),
+        flush=True,
     )
 
     async def _probe() -> None:
         headers = {"Authorization": f"Bearer {config.BRIDGE_TOKEN}"}
-        args = {"message": message}
+        args = {"message": probe_message(live)}
         if assistant:
             args["assistant"] = assistant
         async with httpx2.AsyncClient(headers=headers, timeout=15) as http:
@@ -318,11 +482,32 @@ def probe(live: bool = False, assistant: str | None = None) -> None:
                     result = await session.call_tool(config.TOOL_NAME, args)
                     print("result:", result.content[0].text)
 
-    try:
-        asyncio.run(_probe())
-    except Exception as e:
+    asyncio.run(_probe())
+
+
+def probe(live: bool = False, assistant: str | None = None) -> None:
+    """Client-side diagnostic: talk to every configured route the way the
+    phone talks to it — the MCP door over Streamable HTTP with a tools/call,
+    the webhook door with the app's own multipart body. Dry run by default;
+    the assistant DM is a live channel and --live sends a real message, on
+    every route, that it will act on. --assistant <name> targets a mapped
+    assistant on the MCP route (the webhook route's target is configuration,
+    never the words). BRIDGE_URL overrides the target (e.g. probing a remote
+    install)."""
+    mcp_url, webhook_url = probe_urls()
+    failed = []
+    for route in config.ROUTES:
+        try:
+            if route == "webhook":
+                probe_webhook(webhook_url, live)
+            else:
+                probe_mcp(mcp_url, live, assistant)
+        except Exception as e:
+            print(f"FAILED ({type(e).__name__}): {e}")
+            failed.append(route)
+    if failed:
         sys.exit(
-            f"FAILED ({type(e).__name__}): {e}\n"
+            f"{', '.join(failed)}: probe failed. "
             "Is the server running, and does BRIDGE_TOKEN match?"
         )
 

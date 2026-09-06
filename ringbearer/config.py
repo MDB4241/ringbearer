@@ -144,9 +144,19 @@ except ValueError:
 # ASSISTANT_NAME still personalizes everything the app's LLM reads (the tool
 # description) and everything the user reads (acks, setup text).
 TOOL_NAME = "send_to_assistant"
+def slug(name: str) -> str:
+    """The roster/enum token for a display name: `Hermes` -> `hermes`.
+
+    Roster names are lowercase tokens because a speech-driven agent has to
+    reproduce them; this is the one rule that makes them, and setup asks it
+    the same question the environment does.
+    """
+    return re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or "assistant"
+
+
 # The default assistant's roster/enum name, e.g. Hermes -> hermes. Slugged to
 # a lowercase token like every other roster name.
-ASSISTANT_SLUG = re.sub(r"[^a-z0-9_]+", "_", ASSISTANT_NAME.lower()).strip("_") or "assistant"
+ASSISTANT_SLUG = slug(ASSISTANT_NAME)
 
 
 def parse_assistants(raw: str) -> dict:
@@ -191,6 +201,27 @@ ASSISTANT_ROSTER = {DEFAULT_ASSISTANT: ASSISTANT_CHAT, **_extras}
 # webhook capture lands is configuration and nothing else. Validated here for
 # the same reason ASSISTANTS is: a name that is not in the roster would
 # otherwise fail on every capture, silently, from the ring's point of view.
+# Which doors this install actually uses. Both are always served — this is a
+# declaration, not a switch — but it decides what `setup` and `run` print and
+# what `probe` probes, so a one-assistant install is never handed MCP settings
+# it will never paste into the phone. Unset means both, which is what every
+# install written before this key has: nothing to migrate.
+ALL_ROUTES = ("webhook", "mcp")
+_routes_raw = os.environ.get("ROUTES", "").strip()
+if _routes_raw:
+    _named = [name.strip().lower() for name in _routes_raw.split(",")]
+    _named = [name for name in _named if name]
+    if not _named or any(name not in ALL_ROUTES for name in _named):
+        sys.exit(
+            "ROUTES must be a comma-separated list of "
+            f"{' and '.join(ALL_ROUTES)} (got: {_routes_raw!r}) — edit "
+            f"{STATE_DIR / '.env'}"
+        )
+    # Canonical order, deduplicated: the fast door first, everywhere it is printed.
+    ROUTES = tuple(name for name in ALL_ROUTES if name in _named)
+else:
+    ROUTES = ALL_ROUTES
+
 _webhook_assistant = os.environ.get("WEBHOOK_ASSISTANT", "").strip()
 WEBHOOK_ASSISTANT = _webhook_assistant.lower() or DEFAULT_ASSISTANT
 if WEBHOOK_ASSISTANT not in ASSISTANT_ROSTER:
