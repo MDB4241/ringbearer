@@ -3,7 +3,8 @@
     "keys": [
       "connection",
       "ok",
-      "telegram"
+      "telegram",
+      "transcribe"
     ],
     "status": 200
   },

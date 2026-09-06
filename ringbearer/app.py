@@ -14,8 +14,9 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import config, telegram
+from . import config, telegram, transcribe
 from .route.mcp import McpMethodLogger, mcp
+from .route.webhook import router as webhook_router
 
 
 @asynccontextmanager
@@ -26,6 +27,11 @@ async def lifespan(app: FastAPI):
             "BRIDGE_TOKEN is not set — refusing to start unauthenticated. "
             "First run? python ringbearer.py setup"
         )
+    # Start the model loading before anything else waits on the network: the
+    # first ring capture should find a warm engine, not a cold download. It
+    # loads in transcribe's worker thread, so nothing below is held up by it
+    # and every capture submitted later queues behind it in the same thread.
+    transcribe.start_loading()
     if config.TELEGRAM_ENABLED:
         if not (config.TG_API_ID and config.TG_API_HASH and config.ASSISTANT_CHAT):
             raise RuntimeError(
@@ -132,6 +138,7 @@ async def lifespan(app: FastAPI):
             await supervisor
     if telegram.tg_client is not None:
         await telegram.tg_client.disconnect()
+    transcribe.shutdown()
 
 
 # Docs/OpenAPI off: nothing here is browsable, and the README's "everything
@@ -155,6 +162,14 @@ async def auth_middleware(request: Request, call_next):
         if not token_ok(request.headers.get("authorization")):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
     return await call_next(request)
+
+
+# Registered before the MCP mount, and that order is load-bearing: Starlette
+# matches routes in the order they were added and a Mount claims every path
+# under its prefix, so /ringbearer/webhook added after the mount would be
+# swallowed by the MCP app and never reached. Both live under MCP_MOUNT so the
+# auth middleware's one prefix check covers both doors.
+app.include_router(webhook_router)
 
 
 # host="0.0.0.0" matters: with the default localhost host the SDK auto-enables
@@ -182,4 +197,9 @@ async def healthz(response: Response):
     degraded = config.TELEGRAM_ENABLED and not telegram.tg_health.up
     if degraded:
         response.status_code = 503
-    return {"ok": not degraded, "telegram": config.TELEGRAM_ENABLED, "connection": connection}
+    return {
+        "ok": not degraded,
+        "telegram": config.TELEGRAM_ENABLED,
+        "connection": connection,
+        "transcribe": transcribe.snapshot(),
+    }

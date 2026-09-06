@@ -4,4 +4,5 @@ uvicorn==0.52.1
 python-dotenv==1.2.2
 telethon==1.44.0
 mcp==2.0.0
+python-multipart==0.0.32
 faster-whisper==1.2.1

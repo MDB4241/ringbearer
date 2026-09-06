@@ -141,3 +141,16 @@ if ASSISTANT_SLUG in _extras:
 # exactly one row and never sees any of the multi-assistant machinery.
 DEFAULT_ASSISTANT = ASSISTANT_SLUG
 ASSISTANT_ROSTER = {DEFAULT_ASSISTANT: ASSISTANT_CHAT, **_extras}
+
+# The webhook door's fixed destination (A10). The phone sends no routing
+# information and the door never reads the words to invent any, so where a
+# webhook capture lands is configuration and nothing else. Validated here for
+# the same reason ASSISTANTS is: a name that is not in the roster would
+# otherwise fail on every capture, silently, from the ring's point of view.
+_webhook_assistant = os.environ.get("WEBHOOK_ASSISTANT", "").strip()
+WEBHOOK_ASSISTANT = _webhook_assistant.lower() or DEFAULT_ASSISTANT
+if WEBHOOK_ASSISTANT not in ASSISTANT_ROSTER:
+    sys.exit(
+        f"WEBHOOK_ASSISTANT {_webhook_assistant!r} is not a configured assistant "
+        f"(roster: {', '.join(ASSISTANT_ROSTER)}) — edit {STATE_DIR / '.env'}"
+    )
