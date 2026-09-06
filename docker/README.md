@@ -86,7 +86,7 @@ Deployment systems may render their own `.env` and mount any persistent
 directory at `/data`; Compose is only an example.
 
 The session file grants access to your Telegram account; protect the entire
-state directory like a password. The bearer token gates MCP calls but does not
+state directory like a password. The bearer token gates both routes but does not
 make public-internet exposure safe.
 
 ## Troubleshooting

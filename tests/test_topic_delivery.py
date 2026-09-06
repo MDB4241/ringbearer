@@ -494,7 +494,7 @@ class DurableLoggingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RouteDialsTests(unittest.IsolatedAsyncioTestCase):
-    """C65 / A13: each route delivers on its own dials, and setting one
+    """Each route delivers on its own dials, and setting one
     route's dials never moves the other's.
 
     The globals are pinned to the opposite of whatever the route under test
@@ -563,7 +563,7 @@ class RouteDialsTests(unittest.IsolatedAsyncioTestCase):
                             context=context,
                         )
                         # Same configuration, the other door: it must still
-                        # deliver on its own values (A13).
+                        # deliver on its own values.
                         self.assert_saw(
                             await self.sent_through(other, **dials),
                             topic=not topic,

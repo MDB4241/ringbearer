@@ -88,7 +88,7 @@ def read_back(state: Path, expression: str) -> subprocess.CompletedProcess:
 
 
 class OneAssistantTests(unittest.TestCase):
-    """C70: "no" means one door, and the card for the other one never appears."""
+    """"No" means one door, and the card for the other one never appears."""
 
     def test_no_writes_the_webhook_route_and_prints_only_its_card(self):
         with scripted(*COMMON, "n") as (state, printed):
@@ -113,7 +113,7 @@ class OneAssistantTests(unittest.TestCase):
 
 
 class SeveralAssistantsTests(unittest.TestCase):
-    """C70: "yes" adds the MCP route, its roster, and its card."""
+    """"Yes" adds the MCP route, its roster, and its card."""
 
     def test_yes_collects_the_roster_and_prints_both_cards(self):
         with scripted(*COMMON, "y", "plutus", "@plutus_bot", "") as (state, printed):

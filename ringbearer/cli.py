@@ -363,7 +363,10 @@ def run() -> None:
             ),
             flush=True,
         )
-    print_phone_settings(config.BIND_HOST, str(config.BIND_PORT), config.BRIDGE_TOKEN)
+    # Under launchd or Docker this banner lands in a log file that is not
+    # mode 600 like .env, so the real token is shown only to a terminal.
+    shown_token = config.BRIDGE_TOKEN if sys.stdout.isatty() else "<BRIDGE_TOKEN>"
+    print_phone_settings(config.BIND_HOST, str(config.BIND_PORT), shown_token)
     print(flush=True)
     uvicorn.run(app, host=config.BIND_HOST, port=config.BIND_PORT)
 

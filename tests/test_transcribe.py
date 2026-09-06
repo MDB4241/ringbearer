@@ -58,7 +58,7 @@ def engine(fake, *, state="ready", error=None, durations=()):
 
 
 class TempFileTests(unittest.TestCase):
-    """A11: the audio is a file for the length of one transcription."""
+    """The audio is a file for the length of one transcription."""
 
     def test_engine_reads_the_posted_bytes_and_the_file_is_gone_after(self):
         seen = {}
@@ -198,7 +198,7 @@ class RealEngineTests(unittest.TestCase):
     """The one test that runs faster-whisper for real, on the fixture clip.
 
     Opt-in because it downloads a model and takes seconds, not milliseconds.
-    It is also the C77 probe: the weights land under the state dir, and a
+    It also checks that the weights land under the state dir, and a
     second construction reads them with no network at all.
 
     The four words asserted below — trash, milk, dentist, Thursday — are the

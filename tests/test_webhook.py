@@ -136,7 +136,7 @@ def bridge(rows, *, deliver=None, engine=None, roster=None, webhook_assistant="a
 
 
 class CaptureTests(unittest.TestCase):
-    """C59: the shape of an ordinary capture, in and out."""
+    """The shape of an ordinary capture, in and out."""
 
     def test_a_transcript_bearing_capture_is_logged_and_relayed_verbatim(self):
         rows = []
@@ -159,7 +159,7 @@ class CaptureTests(unittest.TestCase):
         b.deliver.assert_awaited_once_with(spoken, "assistant")
 
     def test_the_row_reaches_captures_jsonl_as_json(self):
-        """log_capture is the real one here — the row must serialize."""
+        """Log_capture is the real one here — the row must serialize."""
         rows = []
         with bridge(rows) as b, patch.object(telegram, "log_capture", REAL_LOG_CAPTURE):
             with patch.object(config, "CAPTURES", b.state / "captures.jsonl"):
@@ -194,7 +194,7 @@ class CaptureTests(unittest.TestCase):
 
 
 class AuthTests(unittest.TestCase):
-    """C60: the door is shut without the token, and shut quietly."""
+    """The door is shut without the token, and shut quietly."""
 
     def test_a_missing_token_is_rejected_and_logs_nothing(self):
         rows = []
@@ -214,7 +214,7 @@ class AuthTests(unittest.TestCase):
 
 
 class TestEventTests(unittest.TestCase):
-    """C61 / A12: the app's Send test event button proves the endpoint and
+    """The app's Send test event button proves the endpoint and
     nothing else — it must never reach a real assistant."""
 
     def test_the_apps_test_event_is_logged_and_never_delivered(self):
@@ -255,7 +255,7 @@ class TestEventTests(unittest.TestCase):
 
 
 class TranscriptionTests(unittest.TestCase):
-    """C62 / C63: who makes the text, and who does not."""
+    """Who makes the text, and who does not."""
 
     def test_audio_only_is_transcribed_here_and_the_text_relayed(self):
         rows = []
@@ -267,7 +267,7 @@ class TranscriptionTests(unittest.TestCase):
 
         with bridge(rows, engine=engine) as b:
             response = post(b.client, audio=("rec-42.m4a", b"fake-m4a-bytes"))
-            self.assertEqual(list((b.state / "tmp").iterdir()), [])  # A11
+            self.assertEqual(list((b.state / "tmp").iterdir()), [])
         self.assertEqual(response.status_code, 200)
         self.assertEqual(seen["bytes"], b"fake-m4a-bytes")
         b.deliver.assert_awaited_once_with("take the trash out tonight", "assistant")
@@ -325,7 +325,7 @@ class TranscriptionTests(unittest.TestCase):
 
         with bridge(rows, engine=engine) as b:
             response = post(b.client, audio=("rec-45.m4a", b"bytes"))
-            self.assertEqual(list((b.state / "tmp").iterdir()), [])  # A11
+            self.assertEqual(list((b.state / "tmp").iterdir()), [])
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["forwarded"])
         b.deliver.assert_not_awaited()
@@ -335,7 +335,7 @@ class TranscriptionTests(unittest.TestCase):
         self.assertNotIn("transcribe_ms", row)
 
     def test_the_row_carries_a_byte_count_never_the_audio(self):
-        """A11: nothing writes audio into captures.jsonl."""
+        """Nothing writes audio into captures.jsonl."""
         rows = []
         audio = CLIP.read_bytes()
         with bridge(rows, engine=lambda path: "spoken words") as b:
@@ -348,7 +348,7 @@ class TranscriptionTests(unittest.TestCase):
 
 
 class FixedTargetTests(unittest.TestCase):
-    """C64 / A10: the door never reads the words to choose a destination."""
+    """The door never reads the words to choose a destination."""
 
     def test_addressing_another_assistant_by_voice_changes_nothing(self):
         rows = []
@@ -370,7 +370,7 @@ class FixedTargetTests(unittest.TestCase):
 
 
 class StartupValidationTests(unittest.TestCase):
-    """C64's other half: a name that is not in the roster stops the process
+    """The other half: a name that is not in the roster stops the process
     while someone is looking, the same way ASSISTANTS does."""
 
     def _import_config(self, **env_overrides):
@@ -407,7 +407,7 @@ class StartupValidationTests(unittest.TestCase):
 
 
 class DedupeTests(unittest.TestCase):
-    """C66: the app's own dedupe is empty after a restart, so ours is not."""
+    """The app's own dedupe is empty after a restart, so ours is not."""
 
     def test_the_same_recording_is_forwarded_once_and_logged_twice(self):
         rows = []
@@ -445,7 +445,7 @@ class DedupeTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
-    """C67: the app follows redirects on a POST and re-sends the whole body,
+    """The app follows redirects on a POST and re-sends the whole body,
     so this route never issues one."""
 
     def test_both_paths_answer_directly(self):
@@ -486,7 +486,7 @@ class RoutingTests(unittest.TestCase):
 
 
 class HealthTests(unittest.TestCase):
-    """C78: the glance, beside the record."""
+    """The glance, beside the record."""
 
     def test_healthz_carries_the_transcribe_block(self):
         rows = []
