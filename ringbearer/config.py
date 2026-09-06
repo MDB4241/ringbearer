@@ -81,6 +81,12 @@ if SESSION_NAME.endswith(".session"):
 # STATE_DIR's containment promise (Path("/data") / "/tmp/x" IS /tmp/x).
 if "/" in SESSION_NAME or SESSION_NAME in ("", ".", ".."):
     sys.exit(f"SESSION_NAME must be a bare file name, not a path (got: {SESSION_NAME!r})")
+# The faster-whisper model the webhook door uses when the phone sends audio
+# instead of a transcript. `base.en` is the starting point; `small.en` is
+# slower and sharper. Anything in transcribe.DISABLED_VALUES ("", "off",
+# "none") turns transcription off entirely — an install whose phone always
+# sends a `transcription` part never needs the model.
+TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "base.en").strip()
 MCP_MOUNT = os.environ.get("MCP_MOUNT", "/ringbearer")
 BIND_HOST = os.environ.get("BIND_HOST", "")
 try:
