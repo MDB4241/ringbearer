@@ -44,15 +44,17 @@ if sys.version_info < (3, 10):
     sys.exit(f"ringbearer needs Python 3.10+ (you have {sys.version.split()[0]}).")
 
 import asyncio
+import hashlib
 import hmac
 import json
 import os
 import random
 import re
 import socket
+import sqlite3
 import sys
 import time
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, closing, contextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 
@@ -84,6 +86,9 @@ STATE_DIR = (Path(_state_raw).expanduser() if _state_raw else HERE).resolve()
 load_dotenv(STATE_DIR / ".env")
 
 CAPTURES = STATE_DIR / "captures.jsonl"
+RECEIPTS_DB = STATE_DIR / "receipts.sqlite3"
+RECEIPT_LIMIT = 100_000  # fail closed when full; never evict duplicate protection
+CAPTURE_DELIVERY_TIMEOUT = 30
 DRY_RUN_PREFIX = "DRYRUN:"
 
 # Terminal color helpers — plain when piped or NO_COLOR is set.
@@ -541,6 +546,125 @@ def log_capture(row: dict) -> None:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+@contextmanager
+def _receipt_connection():
+    """Private from creation, durable commits, bounded SQLite lock waits.
+
+    Only fixed-size hashes and status are stored, never transcripts or errors.
+    The containing state directory must be trusted, on a local filesystem.
+    """
+    RECEIPTS_DB.parent.mkdir(parents=True, exist_ok=True)
+    RECEIPTS_DB.touch(mode=0o600, exist_ok=True)
+    RECEIPTS_DB.chmod(0o600)
+    with closing(sqlite3.connect(RECEIPTS_DB, timeout=1, isolation_level=None)) as conn:
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS receipts ("
+            "key_hash TEXT PRIMARY KEY, content_hash TEXT NOT NULL, "
+            "status TEXT NOT NULL CHECK (status IN ('pending', 'sent')))"
+        )
+        yield conn
+
+
+def _receipt_claim(key_hash: str, content_hash: str) -> str:
+    """Commit intent before any delivery; SQLite arbitrates across processes.
+
+    Pending is deliberately never expired: it could be an active send, or a
+    process that died after Telegram accepted it. Neither is safe to replay.
+    """
+    with _receipt_connection() as conn, conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT content_hash, status FROM receipts WHERE key_hash=?", (key_hash,)
+        ).fetchone()
+        if row is not None:
+            return row[1] if row[0] == content_hash else "conflict"
+        if conn.execute("SELECT count(*) FROM receipts").fetchone()[0] >= RECEIPT_LIMIT:
+            return "full"
+        conn.execute(
+            "INSERT INTO receipts VALUES (?, ?, 'pending')", (key_hash, content_hash)
+        )
+        return "new"
+
+
+def _receipt_finish(key_hash: str, sent: bool) -> None:
+    with _receipt_connection() as conn:
+        if sent:
+            conn.execute("UPDATE receipts SET status='sent' WHERE key_hash=?", (key_hash,))
+        else:
+            # deliver() returns False only before any Telegram RPC. Exceptions
+            # do NOT reach here: even topic creation might have succeeded.
+            conn.execute("DELETE FROM receipts WHERE key_hash=?", (key_hash,))
+
+
+async def _relay_with_receipt(message: str, assistant: str, capture_id: str) -> str:
+    key_hash = hashlib.sha256(capture_id.encode()).hexdigest()
+    # JSON keeps field boundaries unambiguous. Bind the configured destination
+    # and delivery settings too, so changing an alias cannot silently reroute a
+    # retry. Hashes minimize plaintext, not encryption or dictionary resistance.
+    content_hash = hashlib.sha256(json.dumps([
+        message, assistant, ASSISTANT_ROSTER[assistant], DELIVERY_CONTEXT,
+        NEW_TOPIC_PER_CAPTURE, RING_PREFIX,
+    ], ensure_ascii=True).encode()).hexdigest()
+    started = time.monotonic()
+    ambiguous = (
+        "Ambiguous: delivery may have succeeded or may still be in progress. "
+        "This capture_id will not be replayed. Check Telegram directly before "
+        "deciding whether to make a new capture; the local log is not proof of non-delivery."
+    )
+
+    def report(status: str, text: str, sent: bool = False) -> str:
+        # Receipt commits precede this independent transcript log. A log error
+        # must not turn a confirmed send into a retryable failure.
+        try:
+            log_capture({
+                "received_at": datetime.now().astimezone().isoformat(),
+                "source": "mcp", "transcription": message, "assistant": assistant,
+                "forwarded": sent, "delivery_status": status,
+                "telegram_ms": round((time.monotonic() - started) * 1000),
+            })
+        except OSError:
+            text += " Local capture log could not be written."
+        return text
+
+    try:
+        action = _receipt_claim(key_hash, content_hash)
+    except (OSError, sqlite3.Error):
+        return report("failed", "Failed: receipt store unavailable; no delivery attempted.")
+    if action == "sent":
+        return "Duplicate: already delivered; no new delivery attempted."
+    if action == "pending":
+        return ambiguous
+    if action == "conflict":
+        return "Failed: capture_id already used with different content or routing; not delivered."
+    if action == "full":
+        return report("failed", "Failed: receipt store full; no delivery attempted. Existing receipts retained.")
+
+    sent = False
+    try:
+        sent = await asyncio.wait_for(
+            deliver(message, assistant), timeout=CAPTURE_DELIVERY_TIMEOUT
+        )
+        _receipt_finish(key_hash, sent)
+    except asyncio.CancelledError:
+        # The durable pending claim already protects both a cancelled request
+        # and Telethon cancelling an in-flight future. Never release it here.
+        request_recheck()
+        if asyncio.current_task().cancelling():
+            report("ambiguous", ambiguous)
+            raise
+        return report("ambiguous", ambiguous)
+    except Exception:  # noqa: BLE001 - any post-intent exception is ambiguous
+        # Includes lost acknowledgements and a failed post-send receipt commit.
+        # Arbitrary exceptions are not evidence that Telegram rejected a send.
+        request_recheck()
+        return report("ambiguous", ambiguous, sent)
+    if sent:
+        display = ASSISTANT_NAME if assistant == DEFAULT_ASSISTANT else assistant
+        return report("delivered", f"Delivered. {display} will reply in Telegram.", True)
+    return report("failed", "Failed: Telegram delivery unavailable; no send attempted. Safe to retry this capture_id.")
+
+
 def topic_title(message: str) -> str:
     normalized = " ".join(message.split())
     return normalized[:80] or "Ring capture"
@@ -652,12 +776,21 @@ _BASE_DESCRIPTION = (
     "is the only action available: for EVERY user message, call this tool "
     "exactly once with the user's words verbatim and in full. Never "
     "paraphrase, never summarize, never answer the user yourself, and "
-    "never skip the call — even for greetings, tests, or unclear speech."
+    "never skip the call — even for greetings, tests, or unclear speech. "
+    "Optional capture_id: a stable unique ID for this capture (1-128 ASCII "
+    "letters, digits, dots, underscores, colons or hyphens). Reuse it with "
+    "identical arguments after a lost response; a new capture needs a new ID. "
+    "If no stable ID is available, omit it. Never infer an ID from the transcript."
 )
 
 
-async def relay(message: str, assistant: str) -> str:
+async def relay(message: str, assistant: str, capture_id: str | None = None) -> str:
     """The tool body, shared by both registered signatures."""
+    if capture_id is not None and (
+        not isinstance(capture_id, str)
+        or re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", capture_id) is None
+    ):
+        return "Failed: invalid capture_id; use 1-128 ASCII letters, digits, '.', '_', ':' or '-'. Not delivered."
     # Server-side validation regardless of the schema enum: the schema is
     # advisory to a cloud LLM. An off-roster name fails loud with the valid
     # list — the user's words are never silently re-routed to a chat they
@@ -694,6 +827,9 @@ async def relay(message: str, assistant: str) -> str:
         })
         print(f"[mcp] {TOOL_NAME}{route}: DRY RUN — not delivered", flush=True)
         return "Dry run: received, not delivered to Telegram."
+
+    if capture_id is not None:
+        return await _relay_with_receipt(message, assistant, capture_id)
 
     started = time.monotonic()
 
@@ -749,8 +885,8 @@ def register_capture_tool(server, roster):
     assistants add an optional `assistant` argument whose enum IS the
     discovery mechanism: the app's agent sees the valid names inside the
     tool schema it fetches at connect — no listing round trip, nothing to
-    keep in sync by hand. A single-assistant install registers exactly the
-    historical signature; the feature is invisible until ASSISTANTS is set."""
+    keep in sync by hand. capture_id is optional in both roster modes;
+    existing callers need not supply it."""
     if len(roster) > 1:
         from typing import Annotated
 
@@ -772,14 +908,15 @@ def register_capture_tool(server, roster):
 
         @server.tool(name=TOOL_NAME, description=description)
         async def send_to_assistant(
-            message: str, assistant: names = DEFAULT_ASSISTANT
+            message: str, assistant: names = DEFAULT_ASSISTANT,
+            capture_id: str | None = None,
         ) -> str:
-            return await relay(message, assistant)
+            return await relay(message, assistant, capture_id)
     else:
 
         @server.tool(name=TOOL_NAME, description=_BASE_DESCRIPTION)
-        async def send_to_assistant(message: str) -> str:
-            return await relay(message, DEFAULT_ASSISTANT)
+        async def send_to_assistant(message: str, capture_id: str | None = None) -> str:
+            return await relay(message, DEFAULT_ASSISTANT, capture_id)
 
     return send_to_assistant
 
@@ -793,7 +930,9 @@ def ring_routing() -> str:
     return (
         f"Every user message is a voice capture meant for {ASSISTANT_NAME}. "
         f"Call {TOOL_NAME} exactly once with the message verbatim, then reply "
-        "only 'Sent.'"
+        "'Sent.' only for confirmed delivery (including an already-delivered "
+        "duplicate). Otherwise report the tool's failed or ambiguous outcome "
+        "briefly, without claiming success or making another delivery attempt."
     )
 
 

@@ -90,9 +90,9 @@ The probe builds its token from the local config — if the target runs
 different settings, point `RINGBEARER_STATE_DIR` at that install's state
 directory too.
 
-There is also an offline test suite covering delivery routing, including the
-fail-closed topic path — `.venv/bin/python -m unittest` — no network, no
-Telegram account involved.
+There is also an offline test suite covering routing and duplicate-safe
+delivery. Run `.venv/bin/python tests/run_isolated.py` to use disposable state
+and fake Telegram clients, without loading your configuration or session.
 
 ## Phone settings (Pebble app)
 
@@ -204,8 +204,67 @@ Test a mapping without the ring:
 .venv/bin/python ringbearer.py probe --assistant plutus
 ```
 
-Without `ASSISTANTS` set, none of this exists — the tool keeps its single
-`message` argument.
+Without `ASSISTANTS` set, the tool has no `assistant` argument. Only `message`
+is required; `capture_id` is optional in either roster mode.
+
+## Duplicate-safe captures
+
+Clients may supply an optional `capture_id` to `send_to_assistant`. Generate
+a unique ID for each new capture (a UUID works), then reuse that exact ID and
+the same arguments when retrying after a lost response. IDs accept 1-128 ASCII
+letters, digits, `.`, `_`, `:` and `-`; invalid IDs are rejected, not trimmed.
+Do not derive IDs from speech: intentionally repeated words are separate captures.
+Omitting the ID (or passing `null`) preserves the existing behavior and never
+opens the receipt database. Existing message-only and message/assistant calls
+continue to work. Dry runs do not reserve IDs.
+
+Keyed calls return plain text, as before, with these outcomes:
+
+| Result | Meaning |
+|---|---|
+| `Delivered` | Telegram's send returned successfully and the receipt was committed. |
+| `Duplicate` | This capture was already confirmed delivered. No new send occurs. |
+| `Failed` | This call did not send. Invalid input, a conflicting ID, unavailable/full storage, and disabled/unavailable delivery include an explanation. Only proven no-send attempts release their claim for retry. |
+| `Ambiguous` | An attempt may have succeeded or may still be in progress. The ID remains blocked, including after a restart. |
+
+An ID is bound to its transcript, assistant name, configured destination, prefix,
+delivery context and topic setting. Reusing it with different content or routing
+is refused, even after configuration changes. A conflicting call never changes
+the existing receipt. Concurrent duplicates do not wait for the first send:
+they report ambiguity while it is in progress, or `Duplicate` once committed.
+
+The bridge commits a `pending` receipt before entering delivery and changes it
+to `sent` only after success. A timeout, cancellation, exception, interrupted
+process or failed post-send receipt write leaves it blocked. Even a topic RPC
+may have succeeded before raising, so its errors are treated conservatively.
+This is duplicate suppression, not guaranteed delivery or an exactly-once
+transaction with Telegram. A crash before the actual send can lose a capture
+rather than risk sending it twice. Check Telegram directly before deliberately
+making a new capture; a missing or failed local log entry does not prove that
+Telegram never received it. Do not automatically retry with a new ID or no ID.
+
+### Receipt storage and privacy
+
+`receipts.sqlite3` lives in `RINGBEARER_STATE_DIR` (the checkout by default),
+is created owner-only (mode 600), and is gitignored along with SQLite sidecars.
+SQLite uses durable `synchronous=FULL` commits and one-second lock waits.
+Use a trusted directory on a local filesystem that honors SQLite locks and
+fsync. Claims are atomic across processes sharing the database, but this does
+not make sharing a Telegram session safe: keep one server per session.
+
+Receipts contain only SHA-256 hashes of IDs and content/routing, plus status.
+No raw IDs, transcripts, chat addresses, message IDs, timestamps or exception
+text are stored there. Hashes are not encryption and can reveal guessable
+content through dictionary attacks. The existing `captures.jsonl` still stores
+transcripts verbatim and is not rotated; new keyed attempts include an outcome
+label, while suppressed retries do not append another transcript copy.
+
+The store retains at most 100,000 receipts, with fixed-size fields and no
+in-memory per-ID cache. There is no automatic expiry or eviction, including
+for ambiguous attempts. When full, new IDs fail closed while existing IDs
+remain protected. No automatic replay or cleanup is performed. Removing or
+rolling back the database removes duplicate protection for affected IDs;
+preserve it across upgrades and do not delete it to resolve an ambiguous call.
 
 ## Network outages
 
