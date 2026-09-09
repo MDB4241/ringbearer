@@ -155,9 +155,10 @@ class ToolSchemaTests(unittest.TestCase):
         (tool,) = asyncio.run(server.list_tools())
         return tool.input_schema
 
-    def test_single_assistant_schema_is_message_only(self):
+    def test_single_assistant_schema_requires_only_message(self):
         schema = self._schema({"assistant": "@a"})
-        self.assertEqual(list(schema["properties"]), ["message"])
+        self.assertEqual(list(schema["properties"]), ["message", "capture_id"])
+        self.assertEqual(schema["required"], ["message"])
 
     def test_multi_assistant_schema_gains_optional_enum(self):
         schema = self._schema({"assistant": "@a", "plutus": "@p"})

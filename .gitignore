@@ -3,6 +3,7 @@
 !.env.example
 *.session*
 captures.jsonl
+receipts.sqlite3*
 .venv/
 __pycache__/
 logs/
