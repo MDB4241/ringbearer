@@ -220,16 +220,50 @@ Telethon can also drop the link by itself, with no probe of the supervisor's
 failing on the way. That is treated as a rebuild rather than a failure: the
 supervisor closes what is left, reconnects, and counts it in `rebuilds`, so a
 link being torn down over and over shows up as a climbing number instead of a
-quiet one. If the supervisor itself ever dies of something unplanned, it is
-logged and restarted after five seconds; the only ways it stops on purpose are
-shutdown and a fatal session.
+quiet one. Rebuilds now use a fresh `TelegramClient`, after the previous client's
+teardown has completed, with topic/send RPCs and replacement serialized by one
+lock. This also discards stale keepalive state rather than patching a sender
+in place.
+
+A later failure left Telethon's update loop wedged while the HTTP process stayed
+alive. Restarting only the supervisor cannot repair that state. A lifespan-owned
+watchdog thread now exits the process with status 1 if supervision crashes,
+returns, is cancelled outside shutdown, or stops advancing. This permits an
+external process manager (for example, systemd with `Restart=on-failure`) to
+recover the whole process. Network outages still retry indefinitely while the
+supervisor is making progress.
+
+Connect and ping retain their 30s and 15s cooperative timeouts. Disconnect gets
+a 30s wait; incomplete teardown forbids replacement. The independent watchdog
+allows 120s for a complete verify/rebuild phase, including waiting for the lock,
+and 180s for startup construction, retry backoff, or healthy polling. It covers
+cancellation-resistant coroutines and a blocked event loop, but cannot cover
+an interpreter or native extension that prevents all Python threads from running.
+Normal shutdown disarms it before cancelling the supervisor and allows 10s for
+best-effort Telegram cleanup. A process manager's stop timeout remains the
+backstop for cancellation-resistant cleanup.
+
+The fatal-update guard isolates one private dependency: Telethon 1.44.0's
+`TelegramClient._updates_error`. That version sets the field before awaiting its
+own shielded disconnect. There is no public handle to join that teardown safely,
+so a recorded error requires process recovery, not another disconnect or client.
+Recheck this assumption when upgrading the pinned Telethon version. Ordinary
+replacement uses public `disconnect()` and waits for completion; cancelling its
+shield does not prove the underlying cleanup ended.
+
+Fail-fast deliberately bypasses async cleanup and log flushing. An in-flight
+send may have an unknown outcome, and its capture row may not have been written
+yet. Reconnection never replays a send or falls back from a failed topic send.
+The tool schema, acknowledgement wording, and capture format are unchanged;
+this is not an exactly-once delivery guarantee.
 
 `/healthz` reports what is actually true:
 
 ```json
 {"ok": true, "telegram": true,
  "connection": {"state": "up", "last_ok_age_s": 4.2, "failed_attempts": 0,
-                "next_retry_s": null, "error": null, "rebuilds": 0}}
+                "next_retry_s": null, "error": null, "rebuilds": 0,
+                "supervised": true}}
 ```
 
 `state` is `up`, `down`, `fatal`, or `disabled`, and it comes from the last
@@ -240,9 +274,27 @@ picks up as an unhealthy container with no change to your compose file. Reading
 the endpoint never costs a Telegram API call, so an open endpoint cannot be
 polled into rate-limit trouble.
 
-`fatal` means Telegram rejected the session: revoked, terminated, or logged out
-elsewhere. That is not an outage, so the supervisor stops instead of hiding it
-behind a growing retry counter. Run `python ringbearer.py login` again.
+`supervised` is false before startup completes and as soon as the supervisor
+stops, even if the last successful probe is recent. A successful delivery cannot
+clear a pending failed-probe/rebuild decision or restore supervisor liveness.
+
+`fatal` means either Telegram rejected the session or client ownership became
+unsafe (for example, incomplete teardown or a fatal update-loop error). Both stop
+the supervisor and exit the serving process. A revoked session still requires
+`python ringbearer.py login`; process restarts cannot repair authorization, so
+use the process manager's restart backoff/rate limits rather than rapid retries.
+
+Run the regression suite without local configuration, session files, or Telegram
+traffic:
+
+```bash
+.venv/bin/python tests/run_isolated.py
+.venv/bin/python -m compileall -q ringbearer.py tests
+```
+
+The suite uses fake clients and in-memory Telethon sessions. Disposable uvicorn
+children verify actual process exit for dead/stalled supervision, and normal
+shutdown and transient outages are checked separately.
 
 ## Security notes
 

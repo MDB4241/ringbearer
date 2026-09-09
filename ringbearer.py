@@ -52,6 +52,7 @@ import re
 import socket
 import sys
 import time
+import threading
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
@@ -216,7 +217,7 @@ def make_tg_client(*, serving: bool = False):
     # launched the process (uvicorn, launchd, a shell — all the same).
     # No flood_sleep_threshold override here: this factory also serves
     # login/setup, where Telethon's default sleeping is the right behavior.
-    # The serving-phase policy is set in lifespan, after the startup probes.
+    # Startup and replacement set the serving flood policy before use.
     #
     # serving=True hands reconnection to connection_supervisor(). Telethon's
     # own policy is five attempts a second apart and then a permanent teardown
@@ -255,7 +256,12 @@ HEALTH_POLL_INTERVAL = 30.0  # seconds between round trips while healthy
 HEALTH_STALE_AFTER = 90.0  # no verified round trip in this long is not "up"
 CONNECT_TIMEOUT = 30.0
 PING_TIMEOUT = 15.0
-SUPERVISOR_RESTART_DELAY = 5.0  # after the supervisor itself dies of something unplanned
+# wait_for is cooperative: cancellation can itself hang. The thread watchdog
+# bounds the entire verify phase, including lock wait and client construction.
+VERIFY_TIMEOUT = 120.0
+SUPERVISOR_WATCHDOG_TIMEOUT = 180.0  # also covers backoff and healthy polls
+SHUTDOWN_TIMEOUT = 10.0
+SERVING_FLOOD_SLEEP_THRESHOLD = 25
 
 
 class ConnectionHealth:
@@ -264,7 +270,7 @@ class ConnectionHealth:
     Deliberately not `client.is_connected()`. That reports the socket and stays
     True while Telethon retries underneath, so it reads healthy during exactly
     the window this class exists to describe. The load-bearing fact is the last
-    time a round trip completed.
+    time a round trip completed, with a supervisor still owning the link.
     """
 
     def __init__(self) -> None:
@@ -272,11 +278,11 @@ class ConnectionHealth:
         self.attempts = 0  # consecutive failures; 0 whenever the link is good
         self.next_retry_in: float | None = None
         self.last_error: str | None = None
-        self.fatal: str | None = None  # auth-class failure; retrying cannot fix it
-        # Connections Telethon tore down on its own that the supervisor then
-        # rebuilt. Not failures — no probe of ours failed — but the number
-        # that would have read "840" during the fifteen-hour churn of
-        # 2026-09-01, when every other field on /healthz looked fine.
+        self.fatal: str | None = None  # auth or unsafe lifecycle failure
+        # False until lifespan starts the supervisor; False again the moment it
+        # stops (fatal return, crash, hang detected). Without this, a dead
+        # supervisor can leave last_ok fresh and /healthz green until staleness.
+        self.supervised = False
         self.rebuilds = 0
 
     def mark_ok(self) -> None:
@@ -294,13 +300,23 @@ class ConnectionHealth:
         self.fatal = error
         self.last_error = error
         self.next_retry_in = None
+        self.supervised = False
+
+    def mark_unsupervised(self, error: str | None = None) -> None:
+        """Supervisor is no longer advancing the link. Health must go red now,
+        not after HEALTH_STALE_AFTER; that window is for a live supervisor that
+        simply has not polled yet."""
+        self.supervised = False
+        self.next_retry_in = None
+        if error is not None:
+            self.last_error = error
 
     @property
     def up(self) -> bool:
-        """True only when a round trip completed recently and nothing has failed
-        since. The staleness arm is the backstop: if the supervisor task dies,
-        `last_ok` ages out and health goes red without a second watchdog."""
-        if self.fatal or self.attempts or self.last_ok is None:
+        """True only when a round trip completed recently, nothing has failed
+        since, and the connection supervisor is still running. Staleness remains
+        a backstop; unsupervised is the immediate signal when supervision ends."""
+        if self.fatal or self.attempts or self.last_ok is None or not self.supervised:
             return False
         return (time.monotonic() - self.last_ok) <= HEALTH_STALE_AFTER
 
@@ -323,11 +339,84 @@ class ConnectionHealth:
             ),
             "error": self.last_error,
             "rebuilds": self.rebuilds,
+            "supervised": self.supervised if TELEGRAM_ENABLED else False,
         }
 
 
 tg_health = ConnectionHealth()
 recheck_now: asyncio.Event | None = None  # created in lifespan
+# Serializes deliver() against client rebuild so a reconnect never races a send
+# onto a half-torn TelegramClient (and so rebuild can replace tg_client safely).
+tg_client_lock: asyncio.Lock | None = None
+watchdog = None  # lifespan-owned SupervisorWatchdog, never started on import
+
+
+def _client_lock() -> asyncio.Lock:
+    global tg_client_lock
+    if tg_client_lock is None:
+        tg_client_lock = asyncio.Lock()
+    return tg_client_lock
+
+
+class UnsafeClientError(RuntimeError):
+    """Teardown was not proven complete; only process replacement is safe."""
+
+
+class SupervisorWatchdog:
+    """Fail the PROCESS, not just an asyncio task, when ownership is lost.
+
+    A daemon thread can fire while the event loop is blocked or cancellation is
+    stuck. os._exit(1) deliberately bypasses broken async cleanup. An external
+    process manager must be configured to restart failures.
+    Nothing on the fatal path may block on logging or the event loop.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._deadline = time.monotonic() + SUPERVISOR_WATCHDOG_TIMEOUT
+        self._phase = "Telegram startup"
+        self._thread = threading.Thread(target=self._run, name="telegram-watchdog", daemon=True)
+        self._thread.start()
+
+    def arm(self, timeout, phase):
+        with self._lock:
+            self._deadline = time.monotonic() + timeout
+            self._phase = phase
+
+    def _fail_locked(self, reason):
+        if not self._stopped.is_set():
+            tg_health.mark_fatal(reason)
+            self._stopped.set()
+            os._exit(1)
+
+    def supervisor_done(self, task):
+        if task.cancelled():
+            reason = "connection supervisor cancelled unexpectedly"
+        else:
+            error = task.exception()  # retrieve even during shutdown
+            reason = f"connection supervisor stopped: {error!r}"
+        with self._lock:
+            self._fail_locked(tg_health.fatal or reason)
+
+    def _run(self):
+        while not self._stopped.wait(0.05):
+            with self._lock:
+                if time.monotonic() >= self._deadline:
+                    self._fail_locked(f"watchdog expired: {self._phase}")
+
+    def stop(self):
+        # Serialize disarm with the fatal decision: after stop returns no future
+        # callback or deadline may deliberately kill a normal shutdown.
+        with self._lock:
+            self._stopped.set()
+        self._thread.join(timeout=1)
+
+
+def _arm_watchdog(timeout, phase):
+    if watchdog is not None:
+        watchdog.arm(timeout, phase)
+
 
 
 def request_recheck() -> None:
@@ -335,6 +424,86 @@ def request_recheck() -> None:
     link, so health should turn red in a second rather than at the next poll."""
     if recheck_now is not None:
         recheck_now.set()
+
+
+def _configure_serving_client(client) -> None:
+    """Flood policy for the long-lived server client (not login/setup)."""
+    client.flood_sleep_threshold = SERVING_FLOOD_SLEEP_THRESHOLD
+
+
+def _check_update_loop(client):
+    # Telethon 1.44.0 (pinned in requirements.txt), client/updates.py, records
+    # _updates_error BEFORE awaiting its own shielded disconnect. This is the
+    # only private Telethon dependency here; recheck it on upgrades.
+    # We cannot join that private teardown task via the public API;
+    # another disconnect/new client could race it. Use the process boundary.
+    error = getattr(client, "_updates_error", None)
+    if error is not None:
+        reason = f"Telethon update loop failed: {type(error).__name__}: {error}"
+        tg_health.mark_fatal(reason)
+        raise UnsafeClientError(reason)
+
+
+async def _discard_client(client) -> None:
+    """Prove teardown completed before opening the session in a new client.
+
+    Telethon 1.44 disconnect() returns a shield around _disconnect_coro().
+    Cancelling that shield does NOT stop teardown. asyncio.wait bounds our wait
+    without waiting for cancellation, but timeout/error means fail closed, NOT
+    abandon-and-reconnect. The lifespan watchdog then terminates the process.
+    """
+    if client is None:
+        return
+    _check_update_loop(client)
+    closing = None
+    try:
+        # Our own attribute, not a Telethon internal. Each instance has exactly
+        # one terminal teardown. Shutdown can rejoin it if verify was cancelled
+        # while the shielded disconnect was still running.
+        closing = getattr(client, "_ringbearer_closing", None)
+        if closing is None:
+            closing = asyncio.ensure_future(client.disconnect())
+            client._ringbearer_closing = closing
+        done, _ = await asyncio.wait({closing}, timeout=CONNECT_TIMEOUT)
+        if not done:
+            raise UnsafeClientError("Telegram teardown timed out; refusing client replacement")
+        if closing.cancelled():
+            raise UnsafeClientError("Telegram teardown was cancelled; refusing replacement")
+        closing.result()
+        _check_update_loop(client)  # it may have failed while teardown was joining
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        tg_health.mark_fatal(f"Telegram teardown incomplete: {exc}")
+        raise UnsafeClientError(f"Telegram teardown incomplete: {exc}") from exc
+    finally:
+        # Retrieve late failures without implying that cancellation closed the
+        # client. Never construct its replacement after this path fails.
+        if closing is not None:
+            closing.add_done_callback(_consume_task_result)
+
+
+def _consume_task_result(task):
+    if not task.cancelled():
+        task.exception()
+
+
+async def _replace_tg_client() -> None:
+    """Drop the live TelegramClient and build a fresh serving one.
+
+    Ordinary failed probes need a fresh object, not another connect() over old
+    background-task handles. Fatal update-loop errors or incomplete teardown
+    refuse replacement and require process recovery instead. Caller must hold
+    tg_client_lock when concurrent deliver() is possible.
+    """
+    global tg_client
+    old = tg_client
+    await _discard_client(old)
+    tg_client = None
+    client = make_tg_client(serving=True)
+    _configure_serving_client(client)
+    tg_client = client
+
 
 
 async def boot_connect(attempts: int = 5, delay: float = 1.0) -> None:
@@ -346,7 +515,10 @@ async def boot_connect(attempts: int = 5, delay: float = 1.0) -> None:
     reaches lifespan's handler on the first try, un-slept.
     """
     for attempt in range(1, attempts + 1):
+        _arm_watchdog(VERIFY_TIMEOUT, "Telegram startup connect")
         try:
+            if attempt > 1:
+                await _replace_tg_client()
             await asyncio.wait_for(tg_client.connect(), timeout=CONNECT_TIMEOUT)
             return
         except (OSError, asyncio.TimeoutError):
@@ -362,66 +534,32 @@ async def verify_connection(*, rebuild: bool = False) -> None:
     cheapest call that proves the far end is answering, which `is_connected()`
     does not.
 
-    `rebuild` tears the connection down before reconnecting instead of trusting
-    `is_connected()`, and the supervisor sets it after any failure. Two reasons,
-    both load-bearing. A client can report connected while the far end is gone:
-    `connect()` marks the sender connected before its layer-init call returns and
-    creates the keepalive task only at the very end, so a timeout landing in that
-    window leaves the flag stuck True with nothing left to notice it, and every
-    later poll pings a corpse forever. And on the ordinary path, Telethon's own
-    teardown leaves `_update_loop` running while `connect()` overwrites its
-    handle, so without an explicit disconnect one update loop leaks per
-    reconnect, each issuing its own calls against the account.
-
-    A socket Telethon already tore down on its own is rebuilt the same way,
-    counted in `rebuilds` rather than as a failure — never patched with a bare
-    `connect()`, for the same leak reason.
+    After failed probes or a disconnected socket, join teardown and create a
+    fresh client under the delivery lock. A recorded fatal update-loop error
+    requires process recovery instead: Telethon has already started a private,
+    shielded teardown we cannot safely race. The lifespan watchdog supplies the
+    hard deadline; the per-call wait_for deadlines below are cooperative only.
     """
     from telethon.tl.functions import PingRequest
 
-    if not rebuild and not tg_client.is_connected():
-        # Telethon tore the link down by itself: with its retries off, its
-        # _reconnect ends in _disconnect, and no probe of ours failed on the
-        # way. Still a full rebuild. The old update and keepalive tasks are
-        # cancelled only by disconnect(), and connect() would start a second
-        # pair beside them — the "Fatal error handling updates" tracebacks of
-        # 2026-09-02 were several update loops applying one difference to one
-        # message box, one leaked pair per silent reconnect, 840 of them.
-        tg_health.rebuilds += 1
-        print("[tg] link torn down underneath the supervisor — rebuilding", flush=True)
-        rebuild = True
-    if rebuild:
-        # This connection is being discarded either way, so failing to close it
-        # politely is not interesting. (CancelledError is a BaseException and
-        # still propagates.)
-        with suppress(Exception):
-            await asyncio.wait_for(tg_client.disconnect(), timeout=CONNECT_TIMEOUT)
-        await asyncio.wait_for(tg_client.connect(), timeout=CONNECT_TIMEOUT)
-        clear_stale_keepalive_ping()
-    await asyncio.wait_for(
-        tg_client(PingRequest(ping_id=random.getrandbits(63))), timeout=PING_TIMEOUT
-    )
-
-
-def clear_stale_keepalive_ping() -> None:
-    """Forget the keepalive ping Telethon lost with the old connection.
-
-    Telethon 1.44 tracks its own keepalive ping in `MTProtoSender._ping` and
-    clears it only when the matching pong arrives (mtprotosender.py:743). When
-    the link dies with that ping in flight, Telethon's own reconnect re-sends
-    every pending request, so the pong comes and the field clears. Ours cannot:
-    with `auto_reconnect=False` its teardown drops every pending request
-    (`_disconnect` → `_pending_state.clear()`), and the connection the
-    supervisor builds next inherits the stale id. From then on every keepalive
-    tick (60s) reads the stale id as "the last ping never came back" and tears
-    the fresh link down (`_keepalive_ping` → `_start_reconnect`). That ran once
-    a minute for fifteen hours on 2026-09-01/02 — 840 teardowns — until one of
-    them landed mid-probe and killed the supervisor. Private attribute, pinned
-    library version, guarded so a stub client in tests needs no sender.
-    """
-    sender = getattr(tg_client, "_sender", None)
-    if sender is not None and hasattr(sender, "_ping"):
-        sender._ping = None
+    _arm_watchdog(VERIFY_TIMEOUT, "Telegram verify/rebuild")
+    async with _client_lock():
+        _check_update_loop(tg_client)
+        # A disconnected object may still own an update loop. Never reconnect
+        # it in place, even on the first failed-socket observation.
+        if not rebuild and (tg_client is None or not tg_client.is_connected()):
+            tg_health.rebuilds += 1
+            print("[tg] link torn down underneath the supervisor; rebuilding", flush=True)
+            rebuild = True
+        if rebuild:
+            await _replace_tg_client()
+            assert tg_client is not None
+            await asyncio.wait_for(tg_client.connect(), timeout=CONNECT_TIMEOUT)
+        assert tg_client is not None
+        await asyncio.wait_for(
+            tg_client(PingRequest(ping_id=random.getrandbits(63))), timeout=PING_TIMEOUT
+        )
+        _check_update_loop(tg_client)
 
 
 def backoff_after(delay: float) -> float:
@@ -449,90 +587,72 @@ async def connection_supervisor() -> None:
     from telethon.errors import AuthKeyError, UnauthorizedError
     from telethon.errors.common import AuthKeyNotFound
 
-    delay = RECONNECT_BACKOFF_START
-    while True:
-        failure: Exception | None = None
-        try:
-            await verify_connection(rebuild=tg_health.attempts > 0)
-        except asyncio.CancelledError:
-            if asyncio.current_task().cancelling():
-                raise  # lifespan is shutting the process down
-            # Not this task's cancellation. When Telethon tears a connection
-            # down without an error (mtprotosender._disconnect, error=None) it
-            # cancels the future of every in-flight request, and a cancelled
-            # future raises CancelledError into whoever awaits it — here, the
-            # health ping. The task itself was never cancelled, and
-            # cancelling() is the only thing that tells the two apart. On
-            # 2026-09-02 this read as shutdown, the loop re-raised, and the
-            # ring was dead for a day with nothing left to reconnect it.
-            failure = ConnectionError("Telegram tore the connection down mid-request")
-        except (UnauthorizedError, AuthKeyError, AuthKeyNotFound) as e:
-            tg_health.mark_fatal(f"{type(e).__name__}: {e}")
-            print(
-                f"[tg] Telegram rejected this session ({type(e).__name__}). That is "
-                "not an outage, so it will not be retried. Fix: "
-                "python ringbearer.py login",
-                flush=True,
-            )
-            return
-        except Exception as e:
-            failure = e
-
-        if failure is not None:
-            wait = jittered(delay)
-            tg_health.mark_failure(f"{type(failure).__name__}: {failure}", wait)
-            print(
-                f"[tg] link down ({type(failure).__name__}: {failure}) — attempt "
-                f"{tg_health.attempts}, retrying in {wait:.0f}s",
-                flush=True,
-            )
-            await asyncio.sleep(wait)
-            delay = backoff_after(delay)
-            continue
-
-        if tg_health.attempts:
-            print(
-                f"[tg] link restored after {tg_health.attempts} failed attempt(s)",
-                flush=True,
-            )
-        tg_health.mark_ok()
+    tg_health.supervised = True
+    try:
         delay = RECONNECT_BACKOFF_START
-        if recheck_now is None:
-            await asyncio.sleep(HEALTH_POLL_INTERVAL)
-            continue
-        recheck_now.clear()
-        with suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(recheck_now.wait(), timeout=HEALTH_POLL_INTERVAL)
+        while True:
+            _arm_watchdog(VERIFY_TIMEOUT, "Telegram supervisor verify")
+            tg_health.next_retry_in = None
+            failure: Exception | None = None
+            try:
+                await verify_connection(rebuild=tg_health.attempts > 0)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise  # lifespan is shutting the process down
+                # Not this task's cancellation. When Telethon tears a connection
+                # down without an error (mtprotosender._disconnect, error=None) it
+                # cancels the future of every in-flight request, and a cancelled
+                # future raises CancelledError into whoever awaits it; here, the
+                # health ping. The task itself was never cancelled, and
+                # cancelling() is the only thing that tells the two apart. On
+                # 2026-09-02 this read as shutdown, the loop re-raised, and the
+                # ring was dead for a day with nothing left to reconnect it.
+                failure = ConnectionError("Telegram tore the connection down mid-request")
+            except UnsafeClientError as e:
+                tg_health.mark_fatal(str(e))
+                return
+            except (UnauthorizedError, AuthKeyError, AuthKeyNotFound) as e:
+                tg_health.mark_fatal(f"{type(e).__name__}: {e}")
+                print(
+                    f"[tg] Telegram rejected this session ({type(e).__name__}). That is "
+                    "not an outage, so it will not be retried. Fix: "
+                    "python ringbearer.py login",
+                    flush=True,
+                )
+                return
+            except Exception as e:
+                failure = e
 
+            if failure is not None:
+                _arm_watchdog(SUPERVISOR_WATCHDOG_TIMEOUT, "Telegram retry backoff")
+                wait = jittered(delay)
+                tg_health.mark_failure(f"{type(failure).__name__}: {failure}", wait)
+                print(
+                    f"[tg] link down ({type(failure).__name__}: {failure}); attempt "
+                    f"{tg_health.attempts}, retrying in {wait:.0f}s",
+                    flush=True,
+                )
+                await asyncio.sleep(wait)
+                delay = backoff_after(delay)
+                continue
 
-async def keep_supervising() -> None:
-    """Run the supervisor for the life of the process, restarting it if it dies
-    of anything it did not plan for.
+            if tg_health.attempts:
+                print(
+                    f"[tg] link restored after {tg_health.attempts} failed attempt(s)",
+                    flush=True,
+                )
+            tg_health.mark_ok()
+            _arm_watchdog(SUPERVISOR_WATCHDOG_TIMEOUT, "Telegram healthy poll")
+            delay = RECONNECT_BACKOFF_START
+            if recheck_now is None:
+                await asyncio.sleep(HEALTH_POLL_INTERVAL)
+                continue
+            recheck_now.clear()
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(recheck_now.wait(), timeout=HEALTH_POLL_INTERVAL)
 
-    The supervisor ends on purpose in exactly two ways: cancelled by lifespan at
-    shutdown, or returned after an auth-class failure. Anything else is a bug,
-    and the right response to a bug in the one thing keeping the ring alive is
-    to say so and start it again — not to leave /healthz red until a person
-    notices, which is how 2026-09-02 went. The death is marked as a failure so
-    the restarted loop rebuilds the connection instead of trusting it.
-    """
-    while True:
-        try:
-            await connection_supervisor()
-            return
-        except asyncio.CancelledError:
-            if asyncio.current_task().cancelling():
-                raise
-            reason = "CancelledError from a cancelled future"
-        except Exception as e:
-            reason = f"{type(e).__name__}: {e}"
-        tg_health.mark_failure(f"supervisor died ({reason})", SUPERVISOR_RESTART_DELAY)
-        print(
-            f"[tg] supervisor died ({reason}) — restarting in "
-            f"{SUPERVISOR_RESTART_DELAY:.0f}s",
-            flush=True,
-        )
-        await asyncio.sleep(SUPERVISOR_RESTART_DELAY)
+    finally:
+        tg_health.mark_unsupervised()
 
 
 def log_capture(row: dict) -> None:
@@ -585,7 +705,11 @@ async def create_topic(title: str, peer) -> int:
     from telethon.tl.types import MessageActionTopicCreate, UpdateMessageID
 
     request = CreateForumTopicRequest(peer=peer, title=title)
-    result = await tg_client(request)
+    async with _client_lock():
+        if tg_client is None or tg_health.fatal:
+            raise ConnectionError("Telegram client unavailable")
+        _check_update_loop(tg_client)
+        result = await tg_client(request)
     # The result is an Updates union: usually a container with .updates, but
     # UpdateShort carries a single .update — normalize both shapes.
     updates = getattr(result, "updates", None)
@@ -613,7 +737,7 @@ async def create_topic(title: str, peer) -> int:
 async def deliver(message: str, assistant: str | None = None) -> bool:
     """Post into the target assistant's DM as the user. Returns True if
     actually sent. `assistant` is a roster name; None means the default."""
-    if not (TELEGRAM_ENABLED and tg_client is not None):
+    if not TELEGRAM_ENABLED:
         return False
     name = assistant or DEFAULT_ASSISTANT
     target = assistant_entities.get(name)
@@ -631,13 +755,16 @@ async def deliver(message: str, assistant: str | None = None) -> bool:
     # full"), so *, _, ` and [] must arrive as characters, not formatting.
     # reply_to targets the topic's root service message, which threads the
     # send into that topic; None is Telethon's default (no threading).
-    await tg_client.send_message(
-        target,
-        format_delivery_message(message),
-        parse_mode=None,
-        reply_to=reply_to,
-    )
-    tg_health.mark_ok()
+    text = format_delivery_message(message)
+    async with _client_lock():
+        if tg_client is None or tg_health.fatal:
+            raise ConnectionError("Telegram client unavailable")
+        _check_update_loop(tg_client)
+        await tg_client.send_message(
+            target, text, parse_mode=None, reply_to=reply_to,
+        )
+    # Only the supervisor clears failed-probe evidence. A successful send must
+    # not suppress a pending rebuild or make dead supervision look healthy.
     return True
 
 
@@ -827,10 +954,8 @@ class McpMethodLogger:
 # --- HTTP app ----------------------------------------------------------------
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global tg_client, recheck_now
-    supervisor = None
+async def _telegram_startup():
+    global tg_client
     if not BRIDGE_TOKEN:
         raise RuntimeError(
             "BRIDGE_TOKEN is not set — refusing to start unauthenticated. "
@@ -870,7 +995,7 @@ async def lifespan(app: FastAPI):
         # FloodWaitError branch below exists precisely to prevent it. deliver()
         # has the same 30s deadline and the same reason to want this.
         # login/setup keep Telethon's default via the untouched factory.
-        tg_client.flood_sleep_threshold = 25
+        _configure_serving_client(tg_client)
         # connect(), never start(): start() would prompt for a phone number on
         # an unauthorized session, and this path must stay launchd-safe. A bad
         # session fails fast with the fix named instead of a crash-loop
@@ -879,6 +1004,7 @@ async def lifespan(app: FastAPI):
         # lifespan pending forever with /healthz never binding.
         try:
             await boot_connect()
+            _arm_watchdog(VERIFY_TIMEOUT, "Telegram startup authorization")
             # get_me(), never is_user_authorized(): the latter swallows EVERY
             # RPC error into False — a flood wait would read as "revoked" and
             # the advice below would tell the user to delete a healthy session
@@ -915,6 +1041,7 @@ async def lifespan(app: FastAPI):
         # mapping should die here, while the .env edit is fresh, not weeks
         # later on a walk.
         for _name, _chat in ASSISTANT_ROSTER.items():
+            _arm_watchdog(VERIFY_TIMEOUT, "Telegram startup entity resolution")
             try:
                 assistant_entities[_name] = await asyncio.wait_for(
                     tg_client.get_input_entity(_chat), timeout=30
@@ -932,16 +1059,61 @@ async def lifespan(app: FastAPI):
         # the connection open for the life of the process, and it is what makes
         # /healthz able to answer honestly.
         tg_health.mark_ok()
-        recheck_now = asyncio.Event()
-        supervisor = asyncio.create_task(keep_supervising())
-    async with mcp.session_manager.run():
-        yield
-    if supervisor is not None:
-        supervisor.cancel()
-        with suppress(asyncio.CancelledError):
-            await supervisor
-    if tg_client is not None:
-        await tg_client.disconnect()
+
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global tg_client_lock, recheck_now, tg_health, watchdog
+    tg_health = ConnectionHealth()
+    tg_client_lock = asyncio.Lock()
+    recheck_now = asyncio.Event()
+    assistant_entities.clear()
+    supervisor = None
+    guard = SupervisorWatchdog() if TELEGRAM_ENABLED else None
+    watchdog = guard
+    try:
+        await _telegram_startup()
+        if guard is not None:
+            guard.arm(SUPERVISOR_WATCHDOG_TIMEOUT, "connection supervisor progress")
+            tg_health.supervised = True
+            supervisor = asyncio.create_task(connection_supervisor(), name="telegram-supervisor")
+            supervisor.add_done_callback(guard.supervisor_done)
+        async with mcp.session_manager.run():
+            try:
+                yield
+            finally:
+                # Disarm BEFORE normal MCP/Telegram teardown, including when
+                # the serving context raises or is cancelled.
+                if guard is not None:
+                    guard.stop()
+                tg_health.mark_unsupervised()
+    finally:
+        # Also runs for startup failure, including MCP __aenter__ failures.
+        if guard is not None:
+            guard.stop()
+        tg_health.mark_unsupervised()
+        watchdog = None
+
+        async def cleanup():
+            if supervisor is not None:
+                supervisor.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await supervisor
+            # Do not tear down under an in-flight send or a still-running
+            # verify. If either is stuck, the outer wait returns without a
+            # second owner touching the session.
+            async with _client_lock():
+                await _discard_client(tg_client)
+
+        closing = asyncio.create_task(cleanup(), name="telegram-shutdown")
+        done, _ = await asyncio.wait({closing}, timeout=SHUTDOWN_TIMEOUT)
+        if not done:
+            closing.cancel()
+        closing.add_done_callback(_consume_task_result)
+        # No watchdog kill during shutdown. A pathological cancellation-resistant
+        # task at asyncio.run teardown requires the process manager's stop timeout.
+        recheck_now = None
 
 
 # Docs/OpenAPI off: nothing here is browsable, and the README's "everything
