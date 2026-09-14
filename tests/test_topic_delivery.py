@@ -155,9 +155,13 @@ class ToolSchemaTests(unittest.TestCase):
         (tool,) = asyncio.run(server.list_tools())
         return tool.input_schema
 
-    def test_single_assistant_schema_is_message_only(self):
+    def test_single_assistant_schema_adds_optional_session_reset(self):
         schema = self._schema({"assistant": "@a"})
-        self.assertEqual(list(schema["properties"]), ["message"])
+        self.assertEqual(
+            list(schema["properties"]), ["message", "start_new_conversation"]
+        )
+        self.assertFalse(schema["properties"]["start_new_conversation"]["default"])
+        self.assertEqual(schema["required"], ["message"])
 
     def test_multi_assistant_schema_gains_optional_enum(self):
         schema = self._schema({"assistant": "@a", "plutus": "@p"})
@@ -165,6 +169,16 @@ class ToolSchemaTests(unittest.TestCase):
         self.assertEqual(arg["enum"], ["assistant", "plutus"])
         self.assertEqual(arg["default"], "assistant")
         self.assertEqual(schema["required"], ["message"])
+        self.assertFalse(schema["properties"]["start_new_conversation"]["default"])
+
+    def test_tool_description_limits_when_a_fresh_session_is_requested(self):
+        from mcp.server import MCPServer
+
+        server = MCPServer("schema-test")
+        ringbearer.register_capture_tool(server, {"assistant": "@a"})
+        (tool,) = asyncio.run(server.list_tools())
+        self.assertIn("start_new_conversation", tool.description)
+        self.assertIn("ONLY when the user clearly asks", tool.description)
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
