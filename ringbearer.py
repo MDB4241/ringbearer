@@ -328,6 +328,15 @@ class ConnectionHealth:
 
 tg_health = ConnectionHealth()
 recheck_now: asyncio.Event | None = None  # created in lifespan
+tg_client_lock: asyncio.Lock | None = None
+
+
+def _client_lock() -> asyncio.Lock:
+    """Serialize delivery with reconnects, creating the lock on the live loop."""
+    global tg_client_lock
+    if tg_client_lock is None:
+        tg_client_lock = asyncio.Lock()
+    return tg_client_lock
 
 
 def request_recheck() -> None:
@@ -377,6 +386,12 @@ async def verify_connection(*, rebuild: bool = False) -> None:
     counted in `rebuilds` rather than as a failure — never patched with a bare
     `connect()`, for the same leak reason.
     """
+    async with _client_lock():
+        await _verify_connection_locked(rebuild=rebuild)
+
+
+async def _verify_connection_locked(*, rebuild: bool = False) -> None:
+    """Implementation of verify_connection; caller holds the client lock."""
     from telethon.tl.functions import PingRequest
 
     if not rebuild and not tg_client.is_connected():
@@ -552,12 +567,27 @@ def delivery_mode_label() -> str:
     return "current Telegram conversation"
 
 
-def format_delivery_message(message: str) -> str:
+def format_delivery_message(
+    message: str, start_new_conversation: bool = False
+) -> str:
     """Add recipient-side context without changing the captured transcript."""
-    if DELIVERY_CONTEXT == "conversation":
+    if DELIVERY_CONTEXT == "conversation" and not start_new_conversation:
         return f"{RING_PREFIX}{message}"
+    fresh_session = (
+        f"The bridge has already started a fresh {ASSISTANT_NAME} session "
+        "immediately before this message. Do not send or suggest /new yourself; "
+        "treat this as the first user request in the new session and act on it now.\n"
+        if start_new_conversation
+        else ""
+    )
+    if DELIVERY_CONTEXT == "conversation":
+        return (
+            f"{RING_PREFIX}[RING CAPTURE: FRESH SESSION]\n"
+            f"{fresh_session}\nTranscript:\n{message}"
+        )
     return (
         f"{RING_PREFIX}[RING CAPTURE: ONE-SHOT]\n"
+        f"{fresh_session}"
         "The user is speaking through an Index 01 ring and may not see any reply. "
         "If this message requests an action, treat the spoken request as "
         "authorization and execute it now without asking for confirmation. "
@@ -610,33 +640,45 @@ async def create_topic(title: str, peer) -> int:
     return scanned
 
 
-async def deliver(message: str, assistant: str | None = None) -> bool:
+async def deliver(
+    message: str,
+    assistant: str | None = None,
+    start_new_conversation: bool = False,
+) -> bool:
     """Post into the target assistant's DM as the user. Returns True if
-    actually sent. `assistant` is a roster name; None means the default."""
+    actually sent. `assistant` is a roster name; None means the default.
+    A fresh session is requested with a plain /new immediately before the
+    capture, with both sends serialized against delivery and reconnects."""
     if not (TELEGRAM_ENABLED and tg_client is not None):
         return False
     name = assistant or DEFAULT_ASSISTANT
     target = assistant_entities.get(name)
     if target is None:
         target = ASSISTANT_ROSTER[name]
-    # Topic mode fails closed: if creation raises, nothing is sent — a
-    # capture must never silently land in a thread the user didn't pick.
-    # (The capture is still written to captures.jsonl by the caller.)
-    reply_to = (
-        await create_topic(topic_title(message), target)
-        if NEW_TOPIC_PER_CAPTURE
-        else None
-    )
-    # parse_mode=None: the transcript is a promise ("verbatim and in
-    # full"), so *, _, ` and [] must arrive as characters, not formatting.
-    # reply_to targets the topic's root service message, which threads the
-    # send into that topic; None is Telethon's default (no threading).
-    await tg_client.send_message(
-        target,
-        format_delivery_message(message),
-        parse_mode=None,
-        reply_to=reply_to,
-    )
+    async with _client_lock():
+        # An explicit fresh-session request uses the DM root. Putting /new in
+        # one Telegram topic and its capture in another would split the reset
+        # from the request it governs. Normal topic delivery is unchanged.
+        reply_to = (
+            await create_topic(topic_title(message), target)
+            if NEW_TOPIC_PER_CAPTURE and not start_new_conversation
+            else None
+        )
+        if start_new_conversation:
+            # Await reset acceptance first. If it raises, the transcript is not
+            # sent. An accepted reset followed by a failed transcript remains
+            # visible in Telegram and is never silently replayed here.
+            await tg_client.send_message(
+                target, "/new", parse_mode=None, reply_to=None
+            )
+        # parse_mode=None: the transcript is a promise ("verbatim and in
+        # full"), so *, _, ` and [] arrive as characters, not formatting.
+        await tg_client.send_message(
+            target,
+            format_delivery_message(message, start_new_conversation),
+            parse_mode=None,
+            reply_to=reply_to,
+        )
     tg_health.mark_ok()
     return True
 
@@ -652,11 +694,20 @@ _BASE_DESCRIPTION = (
     "is the only action available: for EVERY user message, call this tool "
     "exactly once with the user's words verbatim and in full. Never "
     "paraphrase, never summarize, never answer the user yourself, and "
-    "never skip the call — even for greetings, tests, or unclear speech."
+    "never skip the call — even for greetings, tests, or unclear speech. "
+    "Optional `start_new_conversation` (default false): leave it false or omit "
+    "it for normal messages. Set it to true ONLY when the user clearly asks "
+    "to start a fresh assistant session. This sends /new immediately before "
+    "the transcript in the same Telegram DM. Never set it merely because the "
+    "subject changed."
 )
 
 
-async def relay(message: str, assistant: str) -> str:
+async def relay(
+    message: str,
+    assistant: str,
+    start_new_conversation: bool = False,
+) -> str:
     """The tool body, shared by both registered signatures."""
     # Server-side validation regardless of the schema enum: the schema is
     # advisory to a cloud LLM. An off-roster name fails loud with the valid
@@ -691,6 +742,7 @@ async def relay(message: str, assistant: str) -> str:
             "assistant": assistant,
             "forwarded": False,
             "dry_run": True,
+            "start_new_conversation": start_new_conversation,
         })
         print(f"[mcp] {TOOL_NAME}{route}: DRY RUN — not delivered", flush=True)
         return "Dry run: received, not delivered to Telegram."
@@ -707,6 +759,7 @@ async def relay(message: str, assistant: str) -> str:
             "assistant": assistant,
             "forwarded": sent,
             "telegram_ms": send_ms,
+            "start_new_conversation": start_new_conversation,
         }
         if err:
             row["error"] = err
@@ -716,7 +769,17 @@ async def relay(message: str, assistant: str) -> str:
     try:
         # Bounded: a Telegram stall must not hold the transcript hostage —
         # timeout lands in the except and the capture row still gets written.
-        sent = await asyncio.wait_for(deliver(message, assistant), timeout=30)
+        delivery = (
+            deliver(message, assistant, start_new_conversation=True)
+            if start_new_conversation
+            else deliver(message, assistant)
+        )
+        # A reset capture performs two serial Telegram sends. Give each the
+        # same worst-case allowance as the historical single-send path rather
+        # than letting a slow /new consume the transcript's entire budget.
+        sent = await asyncio.wait_for(
+            delivery, timeout=60 if start_new_conversation else 30
+        )
     except asyncio.CancelledError as e:
         if asyncio.current_task().cancelling():
             # Cancellation (request dropped, server shutting down) is
@@ -749,8 +812,8 @@ def register_capture_tool(server, roster):
     assistants add an optional `assistant` argument whose enum IS the
     discovery mechanism: the app's agent sees the valid names inside the
     tool schema it fetches at connect — no listing round trip, nothing to
-    keep in sync by hand. A single-assistant install registers exactly the
-    historical signature; the feature is invisible until ASSISTANTS is set."""
+    keep in sync by hand. Single-assistant installs omit only the routing
+    argument; the optional fresh-session flag is available in either shape."""
     if len(roster) > 1:
         from typing import Annotated
 
@@ -772,14 +835,18 @@ def register_capture_tool(server, roster):
 
         @server.tool(name=TOOL_NAME, description=description)
         async def send_to_assistant(
-            message: str, assistant: names = DEFAULT_ASSISTANT
+            message: str,
+            assistant: names = DEFAULT_ASSISTANT,
+            start_new_conversation: bool = False,
         ) -> str:
-            return await relay(message, assistant)
+            return await relay(message, assistant, start_new_conversation)
     else:
 
         @server.tool(name=TOOL_NAME, description=_BASE_DESCRIPTION)
-        async def send_to_assistant(message: str) -> str:
-            return await relay(message, DEFAULT_ASSISTANT)
+        async def send_to_assistant(
+            message: str, start_new_conversation: bool = False
+        ) -> str:
+            return await relay(message, DEFAULT_ASSISTANT, start_new_conversation)
 
     return send_to_assistant
 

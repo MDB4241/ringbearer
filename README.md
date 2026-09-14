@@ -177,6 +177,26 @@ assistant receives. Captures remain logged verbatim, topic titles still use
 the raw transcript, and the Pebble cloud agent remains a relay rather than an
 executor.
 
+### Select a fresh assistant session from speech
+
+The `send_to_assistant` tool also exposes an optional
+`start_new_conversation` boolean. It defaults to `false`, so existing clients
+and ordinary captures are unchanged. When the user clearly asks to start a new
+assistant session, the app's agent may set it to `true`. Ringbearer then sends a
+plain `/new` command followed by the verbatim capture in the same Telegram DM.
+
+Both sends are serialized against other captures and reconnects. If `/new`
+fails, the transcript is not sent. If `/new` succeeds but the transcript send
+fails, Ringbearer reports the failure and does not retry either message itself.
+A client-level retry can repeat the reset because this flag does not provide
+idempotency. A `DRYRUN:` probe never sends `/new` or the transcript.
+
+An explicit fresh-session request uses the DM root even when
+`NEW_TOPIC_PER_CAPTURE=true`; ordinary captures still use the configured topic
+behaviour. This keeps `/new` and the request it governs in one delivery context.
+The tool description tells the app's agent not to set the flag merely because
+the subject changed.
+
 ## Multiple assistants
 
 One bridge can carry to more than one assistant. Map the extras in `.env`:
@@ -204,8 +224,8 @@ Test a mapping without the ring:
 .venv/bin/python ringbearer.py probe --assistant plutus
 ```
 
-Without `ASSISTANTS` set, none of this exists — the tool keeps its single
-`message` argument.
+Without `ASSISTANTS` set, the routing argument is absent. The tool still has
+the required `message` argument and optional `start_new_conversation` flag.
 
 ## Network outages
 
