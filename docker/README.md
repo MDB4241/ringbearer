@@ -44,7 +44,10 @@ Setup takes the listen address from the container's environment (`0.0.0.0`,
 the listener inside the container) and skips that question. Configure Pebble
 with the host address selected above, not `0.0.0.0`. Setup writes `.env`, the
 Telegram login writes `ringbearer.session`, and delivery writes
-`captures.jsonl`; all remain under `docker/data/`.
+`captures.jsonl`; all remain under `docker/data/`. The first start also
+downloads the faster-whisper model (about 150 MB for `base.en`) into
+`docker/data/models/`; it survives rebuilds, and deleting it only means the
+next start downloads it again.
 
 Test the foreground bridge, press Ctrl-C, then start it in the background:
 
