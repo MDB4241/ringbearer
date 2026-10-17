@@ -6,3 +6,5 @@ telethon==1.44.0
 mcp==2.0.0
 python-multipart==0.0.32
 faster-whisper==1.2.1
+# faster-whisper 1.2.1 passes metadata_errors to av.open; PyAV 19 removed it.
+av==18.0.0
