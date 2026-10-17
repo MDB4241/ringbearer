@@ -25,6 +25,7 @@ from collections import deque
 from datetime import datetime
 
 from fastapi import APIRouter, File, Form, Header, UploadFile
+from fastapi.responses import JSONResponse
 
 from .. import config, telegram, transcribe
 
@@ -59,12 +60,14 @@ async def webhook(
 ):
     """Take one ring capture off the phone and deliver it.
 
-    Returns: a small JSON body describing what happened, built from the capture
-    row `relay` wrote. Any 2xx satisfies the app, which never reads a
-    successful body — the body is for curl and for a human reading `Recent
-    runs` after a non-2xx. Every outcome short of an unhandled crash is a 200:
-    a payload with nothing in it is a fact to log, not a server error, and
-    there is no retry on the phone for a 5xx to earn.
+    Returns: logged non-delivery reasons that are expected (test, dry run,
+    duplicate, empty input) remain 200. A transcription failure is 503; a
+    Telegram delivery failure retains HTTP 200 with ok=false and retry_safe=false:
+    Telegram may have accepted the message before the connection failed. Returning
+    a retryable HTTP error could duplicate an action. Clients must inspect the
+    body and must not automatically replay an uncertain delivery. The phone may
+    show this acknowledged-but-failed request as successful because it only checks
+    HTTP status. Durable receipts are needed to improve that safely.
     """
     data = await audio.read() if audio is not None else b""
     filename = audio.filename if audio is not None else None
@@ -156,4 +159,11 @@ async def webhook(
         body["reason"] = reason
     if row.get("error"):
         body["error"] = row["error"]
+
+    if reason == "transcription failed":
+        body["ok"] = False
+        return JSONResponse(body, status_code=503)
+    if row.get("error") and not row["forwarded"]:
+        body["ok"] = False
+        body["retry_safe"] = False
     return body

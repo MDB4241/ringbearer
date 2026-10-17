@@ -169,12 +169,14 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(written[0]["source"], "webhook")
         self.assertEqual(written[0]["audio_bytes"], 12)
 
-    def test_a_delivery_failure_is_still_a_two_hundred_and_a_row(self):
+    def test_a_delivery_failure_is_acknowledged_but_marked_unsafe_to_retry(self):
         rows = []
         deliver = AsyncMock(side_effect=RuntimeError("boom"))
         with bridge(rows, deliver=deliver) as b, patch.object(telegram, "request_recheck"):
             response = post(b.client, transcription="hello")
         self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["ok"])
+        self.assertFalse(response.json()["retry_safe"])
         self.assertFalse(response.json()["forwarded"])
         self.assertIn("boom", response.json()["error"])
         (row,) = rows
@@ -317,7 +319,7 @@ class TranscriptionTests(unittest.TestCase):
         self.assertEqual(row["reason"], route_webhook.NOTHING_TO_SAY)
         self.assertIsNone(row["transcription"])
 
-    def test_an_engine_failure_is_logged_not_five_hundred(self):
+    def test_an_engine_failure_is_logged_and_returns_service_unavailable(self):
         rows = []
 
         def engine(path):
@@ -326,7 +328,8 @@ class TranscriptionTests(unittest.TestCase):
         with bridge(rows, engine=engine) as b:
             response = post(b.client, audio=("rec-45.m4a", b"bytes"))
             self.assertEqual(list((b.state / "tmp").iterdir()), [])
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.json()["ok"])
         self.assertFalse(response.json()["forwarded"])
         b.deliver.assert_not_awaited()
         (row,) = rows
