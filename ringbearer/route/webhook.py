@@ -25,8 +25,10 @@ from collections import deque
 from datetime import datetime
 
 from fastapi import APIRouter, File, Form, Header, UploadFile
+from fastapi.responses import JSONResponse
 
 from .. import config, telegram, transcribe
+from ..native_voice import relay_voice
 
 router = APIRouter()
 
@@ -88,6 +90,16 @@ async def webhook(
     if audio is not None:
         # A11: how much audio arrived, never the audio itself.
         extra["audio_bytes"] = len(data)
+
+    if config.WEBHOOK_DELIVERY_FORMAT == "voice" and not is_test and not duplicate:
+        if not data:
+            telegram.log_capture(dict(extra, source="webhook", delivery_format="voice",
+                                      forwarded=False, reason="native voice mode requires audio"))
+            return JSONResponse({"ok": False, "forwarded": False,
+                                 "reason": "native voice mode requires audio"}, status_code=422)
+        if filename:
+            _seen.append(filename)
+        return await relay_voice(data, extra)
 
     transcribe_ms = None
     reason = None

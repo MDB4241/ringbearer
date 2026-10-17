@@ -62,6 +62,9 @@ ASSISTANT_CHAT = int(_chat) if re.fullmatch(r"-?\d+", _chat) else _chat
 ASSISTANT_NAME = os.environ.get("ASSISTANT_NAME", "assistant")
 RING_PREFIX = os.environ.get("RING_PREFIX", "\U0001f3a4 ")
 DELIVERY_CONTEXT = os.environ.get("DELIVERY_CONTEXT", "conversation").lower()
+WEBHOOK_DELIVERY_FORMAT = os.environ.get("WEBHOOK_DELIVERY_FORMAT", "text").strip().lower()
+if WEBHOOK_DELIVERY_FORMAT not in {"text", "voice"}:
+    sys.exit("WEBHOOK_DELIVERY_FORMAT must be 'text' or 'voice'")
 if DELIVERY_CONTEXT not in {"conversation", "one_shot"}:
     sys.exit(
         "DELIVERY_CONTEXT must be 'conversation' or 'one_shot' "

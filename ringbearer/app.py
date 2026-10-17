@@ -137,7 +137,8 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await supervisor
     if telegram.tg_client is not None:
-        await telegram.tg_client.disconnect()
+        async with telegram._client_lock():
+            await telegram.tg_client.disconnect()
     transcribe.shutdown()
 
 

@@ -275,6 +275,29 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                     await task
 
 
+class ClientOwnershipLockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconnect_disconnect_and_ping_hold_the_send_lock(self):
+        lock = asyncio.Lock()
+        events = []
+        class Client:
+            async def disconnect(self):
+                self.assert_locked("disconnect")
+            async def connect(self):
+                self.assert_locked("connect")
+            async def __call__(self, request):
+                self.assert_locked("ping")
+        client = Client()
+        client.assert_locked = lambda action: (events.append(action), self.assertTrue(lock.locked()))
+        with (
+            patch.object(telegram, "tg_client", client),
+            patch.object(telegram, "_client_lock", return_value=lock),
+            patch.object(telegram, "clear_stale_keepalive_ping"),
+        ):
+            await telegram.verify_connection(rebuild=True)
+        self.assertEqual(events, ["disconnect", "connect", "ping"])
+        self.assertFalse(lock.locked())
+
+
 class BootConnectTests(unittest.IsolatedAsyncioTestCase):
     async def test_boot_keeps_the_tolerance_telethon_used_to_provide(self):
         attempts = []

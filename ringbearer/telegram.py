@@ -23,6 +23,20 @@ from typing import NamedTuple
 from . import config
 
 tg_client = None
+tg_client_lock: asyncio.Lock | None = None
+_tg_client_lock_loop = None
+
+
+def _client_lock() -> asyncio.Lock:
+    """One lock for sends, voice uploads, and client lifecycle ownership."""
+    global tg_client_lock, _tg_client_lock_loop
+    loop = asyncio.get_running_loop()
+    if tg_client_lock is None or _tg_client_lock_loop is not loop:
+        tg_client_lock = asyncio.Lock()
+        _tg_client_lock_loop = loop
+    return tg_client_lock
+
+
 assistant_entities: dict = {}  # roster name -> entity, resolved at startup; see lifespan
 
 
@@ -195,31 +209,31 @@ async def verify_connection(*, rebuild: bool = False) -> None:
     counted in `rebuilds` rather than as a failure — never patched with a bare
     `connect()`, for the same leak reason.
     """
-    from telethon.tl.functions import PingRequest
+    async with _client_lock():
+        from telethon.tl.functions import PingRequest
 
-    if not rebuild and not tg_client.is_connected():
-        # Telethon tore the link down by itself: with its retries off, its
-        # _reconnect ends in _disconnect, and no probe of ours failed on the
-        # way. Still a full rebuild. The old update and keepalive tasks are
-        # cancelled only by disconnect(), and connect() would start a second
-        # pair beside them — the "Fatal error handling updates" tracebacks of
-        # 2026-09-02 were several update loops applying one difference to one
-        # message box, one leaked pair per silent reconnect, 840 of them.
-        tg_health.rebuilds += 1
-        print("[tg] link torn down underneath the supervisor — rebuilding", flush=True)
-        rebuild = True
-    if rebuild:
-        # This connection is being discarded either way, so failing to close it
-        # politely is not interesting. (CancelledError is a BaseException and
-        # still propagates.)
-        with suppress(Exception):
-            await asyncio.wait_for(tg_client.disconnect(), timeout=CONNECT_TIMEOUT)
-        await asyncio.wait_for(tg_client.connect(), timeout=CONNECT_TIMEOUT)
-        clear_stale_keepalive_ping()
-    await asyncio.wait_for(
-        tg_client(PingRequest(ping_id=random.getrandbits(63))), timeout=PING_TIMEOUT
-    )
-
+        if not rebuild and not tg_client.is_connected():
+            # Telethon tore the link down by itself: with its retries off, its
+            # _reconnect ends in _disconnect, and no probe of ours failed on the
+            # way. Still a full rebuild. The old update and keepalive tasks are
+            # cancelled only by disconnect(), and connect() would start a second
+            # pair beside them — the "Fatal error handling updates" tracebacks of
+            # 2026-09-02 were several update loops applying one difference to one
+            # message box, one leaked pair per silent reconnect, 840 of them.
+            tg_health.rebuilds += 1
+            print("[tg] link torn down underneath the supervisor — rebuilding", flush=True)
+            rebuild = True
+        if rebuild:
+            # This connection is being discarded either way, so failing to close it
+            # politely is not interesting. (CancelledError is a BaseException and
+            # still propagates.)
+            with suppress(Exception):
+                await asyncio.wait_for(tg_client.disconnect(), timeout=CONNECT_TIMEOUT)
+            await asyncio.wait_for(tg_client.connect(), timeout=CONNECT_TIMEOUT)
+            clear_stale_keepalive_ping()
+        await asyncio.wait_for(
+            tg_client(PingRequest(ping_id=random.getrandbits(63))), timeout=PING_TIMEOUT
+        )
 
 def clear_stale_keepalive_ping() -> None:
     """Forget the keepalive ping Telethon lost with the old connection.
@@ -504,24 +518,25 @@ async def deliver(message: str, assistant: str | None = None, *, dials: Dials | 
     target = assistant_entities.get(name)
     if target is None:
         target = config.ASSISTANT_ROSTER[name]
-    # Topic mode fails closed: if creation raises, nothing is sent — a
-    # capture must never silently land in a thread the user didn't pick.
-    # (The capture is still written to captures.jsonl by the caller.)
-    reply_to = (
-        await create_topic(topic_title(message), target)
-        if dials.topic_per_capture
-        else None
-    )
-    # parse_mode=None: the transcript is a promise ("verbatim and in
-    # full"), so *, _, ` and [] must arrive as characters, not formatting.
-    # reply_to targets the topic's root service message, which threads the
-    # send into that topic; None is Telethon's default (no threading).
-    await tg_client.send_message(
-        target,
-        format_delivery_message(message, dials),
-        parse_mode=None,
-        reply_to=reply_to,
-    )
+    async with _client_lock():
+        # Topic mode fails closed: if creation raises, nothing is sent — a
+        # capture must never silently land in a thread the user didn't pick.
+        # (The capture is still written to captures.jsonl by the caller.)
+        reply_to = (
+            await create_topic(topic_title(message), target)
+            if dials.topic_per_capture
+            else None
+        )
+        # parse_mode=None: the transcript is a promise ("verbatim and in
+        # full"), so *, _, ` and [] must arrive as characters, not formatting.
+        # reply_to targets the topic's root service message, which threads the
+        # send into that topic; None is Telethon's default (no threading).
+        await tg_client.send_message(
+            target,
+            format_delivery_message(message, dials),
+            parse_mode=None,
+            reply_to=reply_to,
+        )
     tg_health.mark_ok()
     return True
 

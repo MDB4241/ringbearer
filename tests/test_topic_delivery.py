@@ -208,6 +208,24 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
         deliver.assert_not_awaited()
         self.assertEqual(result, "Dry run: received, not delivered to Telegram.")
 
+    async def test_text_send_holds_shared_client_lock(self):
+        lock = asyncio.Lock()
+        entity = object()
+        client = FakeTelegramClient()
+        original = client.send_message
+        async def checked_send(*args, **kwargs):
+            self.assertTrue(lock.locked())
+            return await original(*args, **kwargs)
+        client.send_message = checked_send
+        with (
+            routing(entity),
+            patch.object(telegram, "tg_client", client),
+            patch.object(telegram, "_client_lock", return_value=lock),
+            patch.multiple(config, TELEGRAM_ENABLED=True, NEW_TOPIC_PER_CAPTURE=False),
+        ):
+            self.assertTrue(await telegram.deliver("hello"))
+        self.assertFalse(lock.locked())
+
     async def test_direct_delivery_remains_default(self):
         client = FakeTelegramClient()
         entity = object()

@@ -1,7 +1,8 @@
 # Docker
 
-ringbearer's image contains the application. Configuration, the Telegram
-session, and captured transcripts stay in the bind-mounted `data/` directory.
+ringbearer's image contains the application and ffmpeg (used when native voice
+delivery is enabled). Configuration, the Telegram session, and captured
+transcripts stay in the bind-mounted `data/` directory.
 
 ## Setup
 
